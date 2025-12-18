@@ -157,7 +157,11 @@ cd RADLADS-atlas
 pip install -r requirements.txt
 
 # Install dependencies (Option B: manual)
-pip install lightning torch flash-linear-attention triton deepspeed wandb ninja transformers safetensors --upgrade
+pip install lightning torch flash-linear-attention triton deepspeed wandb ninja transformers safetensors python-dotenv --upgrade
+
+# Setup environment variables
+cp env.template .env
+# Edit .env with your API keys (WandB, HuggingFace, etc.)
 
 # Verify installation with tests
 python -m pytest tests/ -v
@@ -354,7 +358,21 @@ python train.py -c configs/atlasqwen0b5.yaml \
 
 WandB logging is enabled by default. Configure via:
 
-### Option 1: Environment Variables
+### Option 1: .env File (Recommended)
+
+```bash
+# Create .env file from template
+cp env.template .env
+
+# Edit .env file with your credentials:
+# WANDB_API_KEY=your-api-key
+# WANDB_PROJECT=atlas-training
+# WANDB_ENTITY=your-username-or-team
+```
+
+The `.env` file is automatically loaded by `train.py` and is gitignored for security.
+
+### Option 2: Environment Variables
 
 ```bash
 export WANDB_API_KEY="your-api-key"
@@ -362,7 +380,7 @@ export WANDB_PROJECT="atlas-training"
 export WANDB_ENTITY="your-username-or-team"
 ```
 
-### Option 2: Config File
+### Option 3: Config File
 
 Edit your config YAML:
 
@@ -373,7 +391,7 @@ train:
   log_every_n_steps: 10 # Logging frequency
 ```
 
-### Option 3: Command Line
+### Option 4: Command Line
 
 ```bash
 python train.py -c configs/atlasqwen0b5.yaml \

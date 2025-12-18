@@ -28,8 +28,7 @@ from src.pipeline import PIPELINE, PIPELINE_ARGS
 from lm_eval import tasks, evaluator, utils
 from lm_eval.models.huggingface import HFLM
 
-from qwen2.modeling_qwen2 import Qwen2ForCausalLM
-from qwen2.configuration_qwen2 import Qwen2Config
+from transformers import Qwen2ForCausalLM, Qwen2Config
 
 from tqdm import tqdm
 

@@ -4,6 +4,10 @@ import logging
 from functools import partial
 from typing import Callable
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()  # This will load .env from current directory
+
 logging.basicConfig(level=logging.INFO)
 
 from src.logger import print0 as print
@@ -48,7 +52,11 @@ if __name__ == "__main__":
     os.environ["RWKV_MODEL_TYPE"] = config.model.tmix
     os.environ["RWKV_CTXLEN"] = str(config.model.ctx_len)
     os.environ["RWKV_HEAD_SIZE_A"] = str(config.model.head_size)
-    os.environ["RWKV_ATTENTION_TYPE"] = config.model.attention_type
+    # Only set RWKV_ATTENTION_TYPE for RWKV models, not Atlas models
+    if hasattr(config.model, 'attention_type') and config.model.attention_type:
+        os.environ["RWKV_ATTENTION_TYPE"] = config.model.attention_type
+    else:
+        os.environ["RWKV_ATTENTION_TYPE"] = ""  # Dummy value for Atlas models
 
     model_name = f'{config.model.tmix}'
     if config.model.tmix2 != '':
@@ -168,12 +176,16 @@ if __name__ == "__main__":
 
     from src.lit import LightningModelWrapper
     from src.model import Transformer
-    from qwen2.configuration_qwen2 import Qwen2Config
+    from transformers import Qwen2Config
 
     from safetensors.torch import load_file
 
     # NOTE - this import MUST come AFTER the JIT gets disabled above or that disabling won't take effect correctly for the model
-    import models.qwen2
+    # Import the appropriate model based on classname
+    if config.model.classname == 'atlasqwen2':
+        import models.atlasqwen2
+    else:
+        import models.qwen2
 
     strategy_obj = config.train.strategy
     if 'fsdp' in config.train.strategy:

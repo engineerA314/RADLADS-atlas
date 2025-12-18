@@ -48,7 +48,9 @@ def tiny_memory_config():
 
 @pytest.fixture
 def device():
-    """Return CPU device for testing."""
+    """Return CUDA device if available, otherwise CPU."""
+    if torch.cuda.is_available():
+        return torch.device('cuda:0')
     return torch.device('cpu')
 
 
@@ -65,7 +67,9 @@ def dtype():
 @pytest.fixture
 def make_input():
     """Factory to create random input tensors."""
-    def _make(batch=2, seq_len=16, dim=64, device='cpu', dtype=torch.float32):
+    default_device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    def _make(batch=2, seq_len=16, dim=64, device=None, dtype=torch.float32):
+        device = device or default_device
         return torch.randn(batch, seq_len, dim, device=device, dtype=dtype)
     return _make
 
@@ -73,7 +77,9 @@ def make_input():
 @pytest.fixture
 def make_token_ids():
     """Factory to create random token ID tensors."""
-    def _make(batch=2, seq_len=16, vocab_size=256, device='cpu'):
+    default_device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    def _make(batch=2, seq_len=16, vocab_size=256, device=None):
+        device = device or default_device
         return torch.randint(0, vocab_size, (batch, seq_len), device=device)
     return _make
 
