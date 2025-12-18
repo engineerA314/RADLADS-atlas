@@ -1,0 +1,69 @@
+# Atlas-LMM Configuration for Qwen 0.5B-scale model
+# Usage: python train.py -c configs/atlasqwen0b5.yaml --train.data_file path/to/data.bin
+
+model:
+  __type__: configs.Atlas_Config
+  classname: atlasqwen2
+
+  # Model architecture (Qwen 0.5B scale)
+  vocab_size: 151936
+  n_embd: 896
+  n_layer: 24
+  dim_ffn: 4864
+  dim_att: 896
+  head_size: 64
+  ctx_len: 2048
+  rms_norm_eps: 1e-6
+
+  # Atlas memory configuration
+  memory_heads: 14 # 896 / 64
+  memory_dim_head: 64
+  use_momentum: true
+  poly_degree: 1
+  poly_mode: "off"
+  qk_norm: true
+  qkv_conv_kernel: null
+
+  # Architecture variant
+  atlas_variant: "lmm" # Pure memory, no attention
+  tie_word_embeddings: true
+
+train:
+  seed_everything: 1337
+
+  # Training settings
+  micro_bsz: 4
+  accumulate_grad_batches: 4
+  gradient_clip_val: 1.0
+
+  # Optimizer
+  optimizer: adamw
+  lr_init: 3e-4
+  lr_final: 1e-5
+  warmup_steps: 100
+  beta1: 0.9
+  beta2: 0.95
+  adam_eps: 1e-8
+  weight_decay: 0.1
+
+  # Training mode
+  attention_distillation_stage: -1 # -1 = standard CE training
+
+  # Output
+  proj_dir: out
+  proj_name: atlas-lmm-0b5
+  epoch_save: 1
+  log_every_n_steps: 10
+
+  # Hardware
+  accelerator: gpu
+  devices: 1
+  num_nodes: 1
+  precision: bf16
+  strategy: auto
+
+  # Data (DCLM-10B defaults)
+  data_type: binidx
+  data_file: data/dclm-10B.bin # Download from HuggingFace (see README)
+  magic_prime: 732461 # For ctx_len=2048, see README for other values
+  my_exit_tokens: 100000000 # ~100M tokens for quick test

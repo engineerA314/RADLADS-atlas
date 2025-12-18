@@ -78,6 +78,23 @@ class FinchC2_Config(Transformer_Config):
     use_v2:int = 1
 
 @dataclass(kw_only=True)
+class Atlas_Config(Transformer_Config):
+    """Configuration for Atlas-RNN models (LMM, MAL, MAG)."""
+    # Memory configuration
+    memory_heads:int = 0  # If 0, computed from dim_att/head_size
+    memory_dim_head:int = 64
+    use_momentum:bool = True
+    poly_degree:int = 1
+    poly_mode:str = 'off'
+    qk_norm:bool = True
+    qkv_conv_kernel:int | None = None
+    # Architecture variant
+    atlas_variant:str = 'lmm'  # 'lmm', 'mal', 'mag'
+    # For MAL/MAG: sliding window attention config
+    sliding_window:int = 512
+    tie_word_embeddings:bool = True
+
+@dataclass(kw_only=True)
 class Runtime_Config:
     run_name:str = ''
     proj_path:str = '.'
