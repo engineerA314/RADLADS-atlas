@@ -1,0 +1,51 @@
+# Atlas Stage 1 Distillation Config
+# This patches HuggingFace Qwen2 model with Atlas attention for Stage 1 distillation
+#
+# Usage:
+#   python train.py -c configs/atlas_distill1.yaml --train.data_file data/test_data
+#
+# Stage 1 = Attention Alignment
+#   - Teacher: Softmax attention (original Qwen2)
+#   - Student: Atlas memory (replaces attention)
+#   - Loss: ||teacher_output - student_output|| at each layer
+
+model:
+  __type__: configs.Transformer_Config
+  hf_path: Qwen/Qwen2.5-0.5B-Instruct
+  ctx_len: 512
+  vocab_size: 151936
+
+  # Atlas attention replacement
+  attn_path: atlasattn.AtlasSelfAttention
+  attn_classes_path: transformers.models.qwen2.modeling_qwen2.QWEN2_ATTENTION_CLASSES
+
+train:
+  proj_suffix: atlas-stage1
+  train_stage: 3
+  load_partial: 1
+
+  data_type: "binidx"
+  data_file: "data/dclm-10B"
+  my_exit_tokens: 100000000
+  magic_prime: 2929793 # For ctx_len=512
+
+  optimizer: adamw
+  lr_decay_type: cos
+  lr_init: 1e-3
+  lr_final: 1e-5
+  warmup_steps: 50
+  beta1: 0.9
+  beta2: 0.95
+  adam_eps: 1e-8
+  weight_decay: 0
+
+  devices: 1
+  num_nodes: 1
+  micro_bsz: 4
+  accumulate_grad_batches: 1
+  strategy: auto
+  grad_cp: 0
+
+  # Stage 1 = Attention Alignment
+  attention_distillation_stage: 1
+

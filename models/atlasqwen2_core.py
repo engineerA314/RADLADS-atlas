@@ -52,6 +52,7 @@ def init_model_state(
     heads: int,
     dim_head: int, 
     use_momentum: bool,
+    omega_window: int = 4,
     device=None, 
     dtype=None
 ) -> AtlasModelState:
@@ -60,7 +61,17 @@ def init_model_state(
     for _ in range(n_layers):
         S = torch.zeros(batch * heads, dim_head, dim_head, device=device, dtype=dtype)
         Z = torch.zeros_like(S) if use_momentum else None
-        mem_state = RNNMemState(seq_index=0, S=S, Z=Z, omega_buffer=None)
+        
+        # Initialize omega_buffer if omega_window > 1
+        if omega_window > 1:
+            omega_buffer = torch.zeros(
+                batch * heads, omega_window - 1, dim_head, dim_head, 2,
+                device=device, dtype=dtype
+            )
+        else:
+            omega_buffer = None
+        
+        mem_state = RNNMemState(seq_index=0, S=S, Z=Z, omega_buffer=omega_buffer)
         layer_states.append(AtlasLayerState(memory_state=mem_state))
     return AtlasModelState(layer_states=layer_states, seen_tokens=0)
 
@@ -92,6 +103,8 @@ class AtlasConfig:
     memory_heads: int = 14
     memory_dim_head: int = 64
     use_momentum: bool = True
+    omega_window: int = 4  # Omega window size (must be >= 2)
+    use_omega_gate: bool = True  # Enable learnable omega gate
     poly_degree: int = 1
     poly_mode: str = 'off'
     qk_norm: bool = True
@@ -119,6 +132,8 @@ class AtlasConfig:
             'memory_heads': self.memory_heads,
             'memory_dim_head': self.memory_dim_head,
             'use_momentum': self.use_momentum,
+            'omega_window': self.omega_window,
+            'use_omega_gate': self.use_omega_gate,
             'poly_degree': self.poly_degree,
             'poly_mode': self.poly_mode,
             'qk_norm': self.qk_norm,
@@ -266,6 +281,8 @@ class AtlasLMMBlock(nn.Module):
             dim_head=config.memory_dim_head,
             heads=config.memory_heads,
             use_momentum=config.use_momentum,
+            omega_window=config.omega_window,
+            use_omega_gate=config.use_omega_gate,
             poly_degree=config.poly_degree,
             poly_mode=config.poly_mode,
             qk_norm=config.qk_norm,
@@ -341,6 +358,8 @@ class AtlasMALBlock(nn.Module):
             dim_head=config.memory_dim_head,
             heads=config.memory_heads,
             use_momentum=config.use_momentum,
+            omega_window=config.omega_window,
+            use_omega_gate=config.use_omega_gate,
             poly_degree=config.poly_degree,
             poly_mode=config.poly_mode,
             qk_norm=config.qk_norm,
@@ -470,6 +489,7 @@ class AtlasQwen2Core(nn.Module):
                 heads=self.config.memory_heads,
                 dim_head=self.config.memory_dim_head,
                 use_momentum=self.config.use_momentum,
+                omega_window=self.config.omega_window,
                 device=input_ids.device,
                 dtype=self.embed_tokens.weight.dtype,
             )
@@ -565,6 +585,7 @@ class AtlasQwen2ForCausalLM(nn.Module):
             heads=self.config.memory_heads,
             dim_head=self.config.memory_dim_head,
             use_momentum=self.config.use_momentum,
+            omega_window=self.config.omega_window,
             device=device,
             dtype=dtype,
         )

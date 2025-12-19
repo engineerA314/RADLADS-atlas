@@ -88,6 +88,9 @@ class Atlas_Config(Transformer_Config):
     poly_mode:str = 'off'
     qk_norm:bool = True
     qkv_conv_kernel:int | None = None
+    # Omega configuration (sliding window context)
+    omega_window:int = 4  # Window size for Omega rule (must be >= 2 for proper operation)
+    use_omega_gate:bool = True  # Enable learnable omega gate
     # Architecture variant
     atlas_variant:str = 'lmm'  # 'lmm', 'mal', 'mag'
     # For MAL/MAG: sliding window attention config

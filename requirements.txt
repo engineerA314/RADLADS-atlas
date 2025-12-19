@@ -10,9 +10,11 @@ safetensors>=0.4.0
 # Attention/Memory Kernels
 flash-linear-attention>=0.0.1
 triton>=2.1.0
+assoc-scan>=0.0.2  # Provides AssocScan for efficient RNN parallelization (from lucidrains)
 
 # Training Infrastructure
 deepspeed>=0.12.0
+accelerate>=1.0.0
 wandb>=0.16.0
 ninja>=1.11.0
 

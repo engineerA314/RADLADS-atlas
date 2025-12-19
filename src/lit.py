@@ -108,10 +108,11 @@ class LightningModelWrapper(pl.LightningModule):
                     do_reset = True
 
         # we require that the module supports configure_model for this code to work well
-        #if hasattr(self.model, 'configure_model'):
-        #with self.trainer.init_module(empty_init=True): # FIXME - we can probably use this instead of meta then convert to dtype then to_empty
-        with init_on_meta_device():
-            model.configure_model()
+        # HuggingFace models don't have configure_model, so skip for them
+        if hasattr(model, 'configure_model'):
+            #with self.trainer.init_module(empty_init=True): # FIXME - we can probably use this instead of meta then convert to dtype then to_empty
+            with init_on_meta_device():
+                model.configure_model()
 
         dtype_map = {"bf16-true":torch.bfloat16, "bf16-mixed":torch.bfloat16, "16-true":torch.float16, "16-mixed":torch.float16, "32-true":torch.float32}
         dtype = dtype_map[self.trainer.precision]
@@ -469,8 +470,29 @@ class LightningModelWrapper(pl.LightningModule):
             output_post_attention_hidden_states = self.config.train.attention_distillation_stage in (11, 1)
             # special code for attention output and/or attention matrix loss
             if self.config.model.hf_path != '':
+                # For HuggingFace models with AttentionDistillationWrapper patched layers,
+                # the alignment loss is computed inside each wrapper and stored in _last_alignment_loss
                 results = self.model.forward(x, output_hidden_states=False, output_attentions=True)
-                training_loss = torch.stack(results.attentions, dim=0).mean()
+                
+                # Collect alignment losses from wrapper layers
+                if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+                    losses = []
+                    for layer in self.model.model.layers:
+                        if hasattr(layer.self_attn, '_last_alignment_loss') and layer.self_attn._last_alignment_loss is not None:
+                            losses.append(layer.self_attn._last_alignment_loss)
+                    
+                    if len(losses) > 0:
+                        training_loss = torch.stack(losses, dim=0).mean()
+                    elif results.attentions is not None and len(results.attentions) > 0:
+                        training_loss = torch.stack(results.attentions, dim=0).mean()
+                    else:
+                        # Fallback: use logits-based loss
+                        training_loss = F.cross_entropy(results.logits.view(-1, results.logits.size(-1)), y.view(-1))
+                else:
+                    if results.attentions is not None:
+                        training_loss = torch.stack(results.attentions, dim=0).mean()
+                    else:
+                        training_loss = F.cross_entropy(results.logits.view(-1, results.logits.size(-1)), y.view(-1))
                 #reported_loss = results.loss
             elif self.config.model.classname != '':
                 results = self.model.forward(x, output_hidden_states=False, output_attentions=output_attentions, output_post_attention_hidden_states=output_post_attention_hidden_states)

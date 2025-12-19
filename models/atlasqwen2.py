@@ -129,14 +129,15 @@ def model_state_to_atlas_state(
     heads: int,
     dim_head: int,
     use_momentum: bool,
-    device,
-    dtype,
+    omega_window: int = 4,
+    device=None,
+    dtype=None,
 ) -> AtlasModelState:
     """
     Convert RADLADS ModelState back to AtlasModelState.
     """
     if model_state is None or len(model_state.block_states) == 0:
-        return init_model_state(n_layer, batch, heads, dim_head, use_momentum, device, dtype)
+        return init_model_state(n_layer, batch, heads, dim_head, use_momentum, omega_window, device, dtype)
     
     layer_states = []
     for i in range(n_layer):
@@ -232,6 +233,7 @@ class Model_atlasqwen2(nn.Module):
             heads=self.atlas_config.memory_heads,
             dim_head=self.atlas_config.memory_dim_head,
             use_momentum=self.atlas_config.use_momentum,
+            omega_window=self.atlas_config.omega_window,
             device=token_ids.device,
             dtype=self.model.embed_tokens.weight.dtype,
         )

@@ -181,10 +181,11 @@ if __name__ == "__main__":
     from safetensors.torch import load_file
 
     # NOTE - this import MUST come AFTER the JIT gets disabled above or that disabling won't take effect correctly for the model
-    # Import the appropriate model based on classname
+    # Import the appropriate model based on classname or hf_path
     if config.model.classname == 'atlasqwen2':
         import models.atlasqwen2
-    else:
+    elif config.model.hf_path == '':
+        # Only import models.qwen2 if not using HuggingFace path
         import models.qwen2
 
     strategy_obj = config.train.strategy
@@ -297,8 +298,13 @@ if __name__ == "__main__":
             ReplacementSelfAttnType = locate(config.model.attn_path)
             assert isinstance(ReplacementSelfAttnType, Callable)
 
-            from rwkv6attn import load_and_patch_model_with_attention_replacement
-            model = load_and_patch_model_with_attention_replacement(hf_path, config.model.attn_classes_path, ReplacementSelfAttnType, attention_distillation_stage)
+            # Dynamically import based on attn_path (supports rwkv6attn or atlasattn)
+            attn_module = config.model.attn_path.split('.')[0]  # e.g., 'rwkv6attn' or 'atlasattn'
+            attn_loader = locate(f'{attn_module}.load_and_patch_model_with_attention_replacement')
+            if attn_loader is None:
+                # Fallback to rwkv6attn
+                from rwkv6attn import load_and_patch_model_with_attention_replacement as attn_loader
+            model = attn_loader(hf_path, config.model.attn_classes_path, ReplacementSelfAttnType, attention_distillation_stage)
         elif classname != '':
             model_classpath = f'models.{classname}.Model_{classname}'
             model_factory = locate(model_classpath)

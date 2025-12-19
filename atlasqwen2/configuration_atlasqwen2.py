@@ -29,6 +29,10 @@ class AtlasQwen2Config(PretrainedConfig):
             Dimension per memory head.
         use_momentum (`bool`, *optional*, defaults to True):
             Whether to use momentum in memory updates.
+        omega_window (`int`, *optional*, defaults to 4):
+            Omega window size for sliding window context (must be >= 2).
+        use_omega_gate (`bool`, *optional*, defaults to True):
+            Whether to use learnable omega gate.
         poly_degree (`int`, *optional*, defaults to 1):
             Polynomial feature map degree.
         poly_mode (`str`, *optional*, defaults to 'off'):
@@ -59,6 +63,8 @@ class AtlasQwen2Config(PretrainedConfig):
         memory_heads=14,
         memory_dim_head=64,
         use_momentum=True,
+        omega_window=4,
+        use_omega_gate=True,
         poly_degree=1,
         poly_mode='off',
         qk_norm=True,
@@ -84,6 +90,8 @@ class AtlasQwen2Config(PretrainedConfig):
         self.memory_heads = memory_heads
         self.memory_dim_head = memory_dim_head
         self.use_momentum = use_momentum
+        self.omega_window = omega_window
+        self.use_omega_gate = use_omega_gate
         self.poly_degree = poly_degree
         self.poly_mode = poly_mode
         self.qk_norm = qk_norm
@@ -116,6 +124,8 @@ class AtlasQwen2Config(PretrainedConfig):
             memory_heads=self.memory_heads,
             memory_dim_head=self.memory_dim_head,
             use_momentum=self.use_momentum,
+            omega_window=self.omega_window,
+            use_omega_gate=self.use_omega_gate,
             poly_degree=self.poly_degree,
             poly_mode=self.poly_mode,
             qk_norm=self.qk_norm,

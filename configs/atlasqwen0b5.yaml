@@ -19,6 +19,8 @@ model:
   memory_heads: 14 # 896 / 64
   memory_dim_head: 64
   use_momentum: true
+  omega_window: 4 # Atlas-RNN (OmegaRNNMemoryCell)
+  use_omega_gate: true
   poly_degree: 1
   poly_mode: "off"
   qk_norm: true
