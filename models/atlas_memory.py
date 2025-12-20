@@ -417,6 +417,11 @@ class OmegaRNNMemoryCell(Module):
         B_t = Σ_{p∈W_t} U_t^p v_p φ_p^T   (Cross term)
     
     Then same scalar scan as Titans-RNN.
+    
+    New features:
+    - GQA (Grouped Query Attention): K/V use fewer heads than Q
+    - ROPE (Rotary Position Embedding): Optional positional encoding
+    - GroupNorm: Optional per-head normalization
     """
     
     def __init__(
@@ -424,6 +429,7 @@ class OmegaRNNMemoryCell(Module):
         dim: int,
         dim_head: int = 64,
         heads: int = 1,
+        num_key_value_heads: int | None = None,  # GQA: None means same as heads
         omega_window: int = 1,
         use_omega_gate: bool = True,
         use_momentum: bool = True,
@@ -431,6 +437,10 @@ class OmegaRNNMemoryCell(Module):
         poly_mode: str = 'off',
         qk_norm: bool = True,
         qkv_conv_kernel: int | None = 4,
+        use_rope: bool = False,  # ROPE option
+        rope_theta: float = 10000.0,  # ROPE base frequency
+        max_position_embeddings: int = 2048,  # ROPE max positions
+        use_groupnorm: bool = False,  # GroupNorm option
         use_accelerated_scan: bool = False,
     ):
         super().__init__()
@@ -442,16 +452,47 @@ class OmegaRNNMemoryCell(Module):
         self.use_momentum = use_momentum
         self.qkv_conv_kernel = qkv_conv_kernel
         
+        # GQA setup
+        self.num_key_value_heads = default(num_key_value_heads, heads)
+        self.num_key_value_groups = heads // self.num_key_value_heads
+        assert heads % self.num_key_value_heads == 0, \
+            f"heads ({heads}) must be divisible by num_key_value_heads ({self.num_key_value_heads})"
+        
+        # ROPE setup
+        self.use_rope = use_rope
+        if use_rope:
+            from src.rotary import RotaryEmbedding
+            self.rotary_emb = RotaryEmbedding(
+                max_sequence_length=max_position_embeddings,
+                dim=dim_head,
+                theta=rope_theta
+            )
+        else:
+            self.rotary_emb = None
+        
+        # GroupNorm setup
+        self.use_groupnorm = use_groupnorm
+        if use_groupnorm:
+            dim_inner = dim_head * heads
+            self.groupnorm = nn.GroupNorm(
+                num_groups=heads,
+                num_channels=dim_inner,
+                eps=64e-5
+            )
+        else:
+            self.groupnorm = None
+        
         # Associative scan for parallel computation (use_accelerated=True requires Triton)
         self.assoc_scan = AssocScan(use_accelerated=use_accelerated_scan)
         
         dim_inner = dim_head * heads
+        dim_kv = dim_head * self.num_key_value_heads  # GQA: reduced dimension for K/V
         
-        # Projections
+        # Projections (GQA: K/V use fewer heads)
         self.activation = nn.Identity()
         self.to_q = LinearNoBias(dim, dim_inner)
-        self.to_k = LinearNoBias(dim, dim_inner)
-        self.to_v = LinearNoBias(dim, dim_inner)
+        self.to_k = LinearNoBias(dim, dim_kv)  # GQA: reduced
+        self.to_v = LinearNoBias(dim, dim_kv)  # GQA: reduced
         self.to_out = LinearNoBias(dim_inner, dim)
 
         # Optional depthwise conv
@@ -485,10 +526,10 @@ class OmegaRNNMemoryCell(Module):
             nn.init.zeros_(self.to_omega_gate[0].weight)
             nn.init.constant_(self.to_omega_gate[0].bias, 0.0)
         
-        # Norms
+        # Norms (K norm uses num_kv_heads for GQA)
         self.pre_norm = nn.RMSNorm(dim)
         self.q_norm = MultiheadRMSNorm(dim_head, heads) if qk_norm else nn.Identity()
-        self.k_norm = MultiheadRMSNorm(dim_head, heads) if qk_norm else nn.Identity()
+        self.k_norm = MultiheadRMSNorm(dim_head, self.num_key_value_heads) if qk_norm else nn.Identity()
         
         # Polynomial feature map
         self.phi = PolynomialFeatureMap(dim_head, poly_degree, poly_mode)
@@ -543,8 +584,8 @@ class OmegaRNNMemoryCell(Module):
             v_in = self.v_conv(v_in.transpose(1, 2)).transpose(1, 2)
         
         q = split_heads(self.to_q(q_in), self.heads)
-        k = split_heads(self.to_k(k_in), self.heads)
-        v = split_heads(self.to_v(v_in), self.heads)
+        k = split_heads(self.to_k(k_in), self.num_key_value_heads)  # GQA: fewer heads
+        v = split_heads(self.to_v(v_in), self.num_key_value_heads)  # GQA: fewer heads
         
         # Truncate to original seq_len in case conv changed length
         q = q[:, :, :seq_len]
@@ -553,6 +594,23 @@ class OmegaRNNMemoryCell(Module):
         
         q = self.q_norm(q)
         k = self.k_norm(k)
+        
+        # Apply ROPE if enabled
+        if self.use_rope and self.rotary_emb is not None:
+            # ROPE expects [B, H, T, D] shape
+            q, k = self.rotary_emb(q, k)
+        
+        # GQA: Expand K/V to match Q heads
+        if self.num_key_value_groups > 1:
+            # k: [batch, num_kv_heads, seq, dim_head] -> [batch, heads, seq, dim_head]
+            k = k.unsqueeze(2).expand(
+                batch, self.num_key_value_heads, self.num_key_value_groups, seq_len, d
+            ).reshape(batch, self.heads, seq_len, d)
+            
+            # v: [batch, num_kv_heads, seq, dim_head] -> [batch, heads, seq, dim_head]
+            v = v.unsqueeze(2).expand(
+                batch, self.num_key_value_heads, self.num_key_value_groups, seq_len, d
+            ).reshape(batch, self.heads, seq_len, d)
         
         # Apply polynomial features
         k_flat = k.reshape(batch * self.heads * seq_len, d)
@@ -663,6 +721,12 @@ class OmegaRNNMemoryCell(Module):
         
         retrieved = retrieved.view(batch, self.heads, seq_len, d)
         retrieved = merge_heads(retrieved)
+        
+        # Apply GroupNorm if enabled (before output projection)
+        if self.use_groupnorm and self.groupnorm is not None:
+            # GroupNorm expects [B*T, C] shape
+            retrieved = self.groupnorm(retrieved.reshape(batch * seq_len, -1)).reshape(batch, seq_len, -1)
+        
         retrieved = self.to_out(retrieved)
         
         next_state = RNNMemState(
@@ -685,6 +749,11 @@ class RNNMemory(Module):
     
     NOTE: omega_window=1 should never be used in practice. Always use omega_window >= 2.
     RNNMemoryCell is deprecated and only kept for backwards compatibility.
+    
+    New features:
+    - GQA (Grouped Query Attention)
+    - ROPE (Rotary Position Embedding)
+    - GroupNorm (per-head normalization)
     """
     
     def __init__(
@@ -692,6 +761,7 @@ class RNNMemory(Module):
         dim: int,
         dim_head: int | None = None,
         heads: int = 1,
+        num_key_value_heads: int | None = None,  # GQA
         use_momentum: bool = True,
         poly_degree: int = 1,
         poly_mode: str = 'off',
@@ -699,6 +769,10 @@ class RNNMemory(Module):
         use_omega_gate: bool = True,  # Changed default from False to True
         qk_norm: bool = True,
         qkv_conv_kernel: int | None = 4,
+        use_rope: bool = False,  # ROPE option
+        rope_theta: float = 10000.0,
+        max_position_embeddings: int = 2048,
+        use_groupnorm: bool = False,  # GroupNorm option
     ):
         super().__init__()
         
@@ -710,6 +784,7 @@ class RNNMemory(Module):
             dim=dim,
             dim_head=dim_head,
             heads=heads,
+            num_key_value_heads=num_key_value_heads,  # GQA
             omega_window=omega_window,
             use_omega_gate=use_omega_gate,
             use_momentum=use_momentum,
@@ -717,6 +792,10 @@ class RNNMemory(Module):
             poly_mode=poly_mode,
             qk_norm=qk_norm,
             qkv_conv_kernel=qkv_conv_kernel,
+            use_rope=use_rope,  # ROPE
+            rope_theta=rope_theta,
+            max_position_embeddings=max_position_embeddings,
+            use_groupnorm=use_groupnorm,  # GroupNorm
         )
     
     @property

@@ -102,6 +102,7 @@ class AtlasConfig:
     # Memory configuration
     memory_heads: int = 14
     memory_dim_head: int = 64
+    num_key_value_heads: int | None = None  # GQA: None means same as memory_heads
     use_momentum: bool = True
     omega_window: int = 4  # Omega window size (must be >= 2)
     use_omega_gate: bool = True  # Enable learnable omega gate
@@ -109,6 +110,14 @@ class AtlasConfig:
     poly_mode: str = 'off'
     qk_norm: bool = True
     qkv_conv_kernel: Optional[int] = None
+    
+    # ROPE configuration
+    use_rope: bool = False  # Enable Rotary Position Embedding
+    rope_theta: float = 10000.0  # ROPE base frequency
+    max_position_embeddings: int = 2048  # ROPE max positions
+    
+    # GroupNorm configuration
+    use_groupnorm: bool = False  # Enable per-head GroupNorm
     
     # Architecture variant: 'lmm' (memory only) or 'mal' (memory + attention)
     atlas_variant: str = 'lmm'
@@ -131,6 +140,7 @@ class AtlasConfig:
             'rms_norm_eps': self.rms_norm_eps,
             'memory_heads': self.memory_heads,
             'memory_dim_head': self.memory_dim_head,
+            'num_key_value_heads': self.num_key_value_heads,
             'use_momentum': self.use_momentum,
             'omega_window': self.omega_window,
             'use_omega_gate': self.use_omega_gate,
@@ -138,6 +148,10 @@ class AtlasConfig:
             'poly_mode': self.poly_mode,
             'qk_norm': self.qk_norm,
             'qkv_conv_kernel': self.qkv_conv_kernel,
+            'use_rope': self.use_rope,
+            'rope_theta': self.rope_theta,
+            'max_position_embeddings': self.max_position_embeddings,
+            'use_groupnorm': self.use_groupnorm,
             'ctx_len': self.ctx_len,
             'vocab_padding_idx': self.vocab_padding_idx,
             'tie_word_embeddings': self.tie_word_embeddings,
@@ -280,6 +294,7 @@ class AtlasLMMBlock(nn.Module):
             dim=config.n_embd,
             dim_head=config.memory_dim_head,
             heads=config.memory_heads,
+            num_key_value_heads=config.num_key_value_heads,
             use_momentum=config.use_momentum,
             omega_window=config.omega_window,
             use_omega_gate=config.use_omega_gate,
@@ -287,6 +302,10 @@ class AtlasLMMBlock(nn.Module):
             poly_mode=config.poly_mode,
             qk_norm=config.qk_norm,
             qkv_conv_kernel=config.qkv_conv_kernel,
+            use_rope=config.use_rope,
+            rope_theta=config.rope_theta,
+            max_position_embeddings=config.max_position_embeddings,
+            use_groupnorm=config.use_groupnorm,
         )
         
         # MLP
@@ -357,6 +376,7 @@ class AtlasMALBlock(nn.Module):
             dim=config.n_embd,
             dim_head=config.memory_dim_head,
             heads=config.memory_heads,
+            num_key_value_heads=config.num_key_value_heads,
             use_momentum=config.use_momentum,
             omega_window=config.omega_window,
             use_omega_gate=config.use_omega_gate,
@@ -364,6 +384,10 @@ class AtlasMALBlock(nn.Module):
             poly_mode=config.poly_mode,
             qk_norm=config.qk_norm,
             qkv_conv_kernel=config.qkv_conv_kernel,
+            use_rope=config.use_rope,
+            rope_theta=config.rope_theta,
+            max_position_embeddings=config.max_position_embeddings,
+            use_groupnorm=config.use_groupnorm,
         )
         
         # Sliding window attention

@@ -27,6 +27,8 @@ class AtlasQwen2Config(PretrainedConfig):
             Number of memory attention heads.
         memory_dim_head (`int`, *optional*, defaults to 64):
             Dimension per memory head.
+        num_key_value_heads (`int`, *optional*, defaults to None):
+            Number of key/value heads for GQA. None means same as memory_heads.
         use_momentum (`bool`, *optional*, defaults to True):
             Whether to use momentum in memory updates.
         omega_window (`int`, *optional*, defaults to 4):
@@ -41,14 +43,20 @@ class AtlasQwen2Config(PretrainedConfig):
             Whether to apply normalization to Q and K.
         qkv_conv_kernel (`int`, *optional*, defaults to None):
             Depthwise conv kernel size for Q/K/V (None = disabled).
+        use_rope (`bool`, *optional*, defaults to False):
+            Whether to use Rotary Position Embedding.
+        rope_theta (`float`, *optional*, defaults to 10000.0):
+            ROPE base frequency.
+        max_position_embeddings (`int`, *optional*, defaults to 131072):
+            Maximum sequence length for ROPE.
+        use_groupnorm (`bool`, *optional*, defaults to False):
+            Whether to use GroupNorm for per-head normalization.
         rms_norm_eps (`float`, *optional*, defaults to 1e-6):
             RMS normalization epsilon.
         use_cache (`bool`, *optional*, defaults to True):
             Whether to return memory state for caching.
         tie_word_embeddings (`bool`, *optional*, defaults to True):
             Whether to tie input/output embeddings.
-        max_position_embeddings (`int`, *optional*, defaults to 131072):
-            Maximum sequence length (for compatibility).
     """
 
     model_type = "atlasqwen2"
@@ -62,6 +70,7 @@ class AtlasQwen2Config(PretrainedConfig):
         num_hidden_layers=24,
         memory_heads=14,
         memory_dim_head=64,
+        num_key_value_heads=None,  # GQA
         use_momentum=True,
         omega_window=4,
         use_omega_gate=True,
@@ -69,13 +78,16 @@ class AtlasQwen2Config(PretrainedConfig):
         poly_mode='off',
         qk_norm=True,
         qkv_conv_kernel=None,
+        use_rope=False,  # ROPE
+        rope_theta=10000.0,
+        max_position_embeddings=131072,
+        use_groupnorm=False,  # GroupNorm
         rms_norm_eps=1e-6,
         use_cache=True,
         # Architecture variant
         atlas_variant='lmm',  # 'lmm' (memory only) or 'mal' (memory + attention)
         sliding_window=512,   # For MAL: sliding window attention size
         tie_word_embeddings=True,
-        max_position_embeddings=131072,
         initializer_range=0.02,
         hidden_act="silu",
         pad_token_id=None,
@@ -89,6 +101,7 @@ class AtlasQwen2Config(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.memory_heads = memory_heads
         self.memory_dim_head = memory_dim_head
+        self.num_key_value_heads = num_key_value_heads
         self.use_momentum = use_momentum
         self.omega_window = omega_window
         self.use_omega_gate = use_omega_gate
@@ -96,6 +109,9 @@ class AtlasQwen2Config(PretrainedConfig):
         self.poly_mode = poly_mode
         self.qk_norm = qk_norm
         self.qkv_conv_kernel = qkv_conv_kernel
+        self.use_rope = use_rope
+        self.rope_theta = rope_theta
+        self.use_groupnorm = use_groupnorm
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
         self.atlas_variant = atlas_variant
@@ -123,6 +139,7 @@ class AtlasQwen2Config(PretrainedConfig):
             rms_norm_eps=self.rms_norm_eps,
             memory_heads=self.memory_heads,
             memory_dim_head=self.memory_dim_head,
+            num_key_value_heads=self.num_key_value_heads,
             use_momentum=self.use_momentum,
             omega_window=self.omega_window,
             use_omega_gate=self.use_omega_gate,
@@ -130,6 +147,10 @@ class AtlasQwen2Config(PretrainedConfig):
             poly_mode=self.poly_mode,
             qk_norm=self.qk_norm,
             qkv_conv_kernel=self.qkv_conv_kernel,
+            use_rope=self.use_rope,
+            rope_theta=self.rope_theta,
+            max_position_embeddings=self.max_position_embeddings,
+            use_groupnorm=self.use_groupnorm,
             atlas_variant=self.atlas_variant,
             sliding_window=self.sliding_window,
             ctx_len=self.max_position_embeddings,
