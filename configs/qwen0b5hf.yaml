@@ -1,5 +1,0 @@
-model:
-    __type__: configs.Transformer_Config
-    hf_path: Qwen/Qwen2.5-0.5B-Instruct
-    ctx_len: 512
-    vocab_size: 151936

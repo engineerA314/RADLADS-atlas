@@ -57,16 +57,18 @@ If you're using the **DCLM-10B dataset**, everything is ready for production tra
 **Minimal command to start training:**
 
 ```bash
-# Stage 1: Attention Alignment
-bash scripts/run_stage1.sh 100000000 1
+# Stage 1 (Paper Stage 1): Attention Alignment (HF patching)
+# Args: [tokens] [devices] [ctx_len]
+bash scripts/run_stage1.sh 100000000 1 512
 
-# Stage 2: Logit KL Divergence
-bash scripts/run_stage2.sh out/L6-D512-x060-atlas-stage1/rwkv-final.pth 500000000 1
+# Stage 2 (Paper Stage 2): Logit KL Divergence (teacher KL)
+# Args: <stage1_ckpt> [tokens] [devices] [ctx_len]
+bash scripts/run_stage2.sh out/L6-D512-x060-atlas-stage1/rwkv-final.pth 500000000 1 512
 
-# Stage 3: Long Context (progressive)
-bash scripts/run_stage3.sh out/L6-D512-x060-2/rwkv-final.pth 512 250000000 1
-bash scripts/run_stage3.sh out/L6-D512-x060-4/rwkv-final.pth 1024 250000000 1
-# ... continue to 2048, 4096, 8192, 16384
+# Stage 3 (Paper Stage 3): Long Context (progressive ctx schedule)
+# Args: <stage2_ckpt> [ctx_schedule] [tokens] [devices]
+# Example schedule: 512→1024→2048 (each step loads previous checkpoint)
+bash scripts/run_stage3.sh out/atlas-lmm-0b5-atlas-stage2/rwkv-final.pth 512,1024,2048 250000000 1
 ```
 
 ---
@@ -107,14 +109,15 @@ bash scripts/run_stage3.sh out/L6-D512-x060-4/rwkv-final.pth 1024 250000000 1
 
 **✅ All tests completed on GCP L4 (22GB VRAM)**:
 
-| Test               | Result  | Notes                               |
-| ------------------ | ------- | ----------------------------------- |
-| Pytest Suite       | ✅ Pass | 123 passed (all CUDA tests passing) |
-| Stage 1 Training   | ✅ Pass | Checkpoint: rwkv-init.pth           |
-| Stage 2 Training   | ✅ Pass | Loads Stage 1 checkpoint            |
-| Stage 3a (ctx=128) | ✅ Pass | Loads Stage 2 checkpoint            |
-| Stage 3b (ctx=192) | ✅ Pass | Loads Stage 3a checkpoint           |
-| Omega-RNN Verify   | ✅ Pass | omega_window=4 confirmed            |
+| Test                       | Result  | Notes                                                                |
+| -------------------------- | ------- | -------------------------------------------------------------------- |
+| Pytest Suite               | ✅ Pass | 123 passed (all CUDA tests passing)                                  |
+| Setup (`train_stage=1`)    | ✅ Pass | Checkpoint: `rwkv-init.pth` (initialization only)                    |
+| Paper Stage 1 (Attn Align) | ✅ Pass | HF patching (`atlas_distill1.yaml`), produces checkpoint for Stage 2 |
+| Paper Stage 2 (KL)         | ✅ Pass | Loads Paper Stage 1 checkpoint                                       |
+| Paper Stage 3a (ctx=128)   | ✅ Pass | Loads Paper Stage 2 checkpoint                                       |
+| Paper Stage 3b (ctx=192)   | ✅ Pass | Loads Paper Stage 3a checkpoint                                      |
+| Omega-RNN Verify           | ✅ Pass | omega_window=4 confirmed                                             |
 
 **Test Commands** (for reference):
 
@@ -169,10 +172,10 @@ python train.py \
 # Expected: loss=0.011 (alignment loss), ~5.4GB VRAM
 
 # 6. (Optional) Full Distillation with Teacher Model
-#    Requires teacher model download first
+#    Note: The teacher is configured under `train.teacher` in configs/distill2.yaml.
+#    You do NOT need a separate `qwen0b5hfteacher.yaml` for the tested pipeline.
 python train.py \
     -c configs/atlasqwen0b5.yaml \
-    -c configs/qwen0b5hfteacher.yaml \
     -c configs/distill2.yaml \
     --train.data_file "$TESTDATA128_DATA_FILE" \
     --train.my_exit_tokens 5000 \
@@ -207,7 +210,9 @@ python train.py \
 
 **Stage 2: Logit KL Divergence** (Paper Stage 2, Atlas-LMM)
 
-- **Configs**: `atlasqwen0b5.yaml` + `qwen0b5hfteacher.yaml` + `distill2.yaml`
+- **Configs**: `atlasqwen0b5.yaml` + `distill2.yaml`
+  - Teacher model is defined under `train.teacher` inside `distill2.yaml`
+  - (Optional) You can still add a separate teacher config YAML, but it is not required by the tested pipeline
 - Loads Stage 1 checkpoint into Atlas-LMM architecture
 - Distills teacher logits to student using KL divergence
 - `attention_distillation_stage=2`
@@ -219,7 +224,8 @@ python train.py \
 - **Configs**: `atlasqwen0b5.yaml` + `distill3-{ctx}.yaml`
 - **Progressive Training**: Increases context length gradually (e.g., 128 → 192 → 512 → 1024 → 2048)
 - Each step loads the checkpoint from the previous context length
-- `magic_prime` must be recalculated for each context length
+- `magic_prime` must match `dataset_slot = data_size // ctx_len` for each context length
+  - The updated `scripts/run_stage*.sh` compute a valid `magic_prime` automatically per ctx_len (or you can override it manually)
 - `attention_distillation_stage=-1` (standard CE loss)
 - **⚠️ No teacher model needed** — uses regular CE loss only (per paper)
 - Essential for production use with long contexts
@@ -269,13 +275,13 @@ bash scripts/download_dclm.sh
 
 ```bash
 # Stage 1: Attention Alignment (2-4h on L4)
-bash scripts/run_stage1.sh 100000000 1
+bash scripts/run_stage1.sh 100000000 1 512
 
 # Stage 2: Logit KL Divergence (4-6h on L4)
-bash scripts/run_stage2.sh out/L6-D512-x060-atlas-stage1/rwkv-final.pth 500000000 1
+bash scripts/run_stage2.sh out/L6-D512-x060-atlas-stage1/rwkv-final.pth 500000000 1 512
 
 # Stage 3 (Optional): Long Context (3-5h per stage on L4)
-bash scripts/run_stage3.sh out/L6-D512-x060-2/rwkv-final.pth 2048 250000000 1
+bash scripts/run_stage3.sh out/atlas-lmm-0b5-atlas-stage2/rwkv-final.pth 512,1024,2048 250000000 1
 ```
 
 **See [TRAINING_PLAN.md](TRAINING_PLAN.md) for:**
@@ -361,7 +367,7 @@ wget --continue -O data/dclm-10B.bin https://huggingface.co/datasets/recursal/DC
 
 ```bash
 python train.py -c configs/atlasqwen0b5.yaml \
-    --train.data_file data/dclm-10B.bin \
+    --train.data_file data/dclm-10B \
     --train.devices 1
 ```
 
@@ -467,16 +473,18 @@ The RADLADS paper defines a 3-stage distillation process. Here's how the paper s
 **Option A: Direct HuggingFace Loading (Recommended, No Conversion Needed)**
 
 ```bash
-# Uses hf_path to load teacher directly from HuggingFace
+# Uses hf_path to load teacher directly from HuggingFace.
+# In the validated pipeline, the teacher is configured in configs/distill2.yaml under train.teacher.
 python train.py \
     -c configs/atlasqwen0b5.yaml \
-    -c configs/qwen0b5hfteacher.yaml \
     -c configs/distill2.yaml \
-    --train.data_file data/dclm-10B.bin \
+    --train.data_file data/dclm-10B \
     --train.devices 1
 ```
 
-The `qwen0b5hfteacher.yaml` config contains:
+If you prefer to keep the teacher model config in a separate YAML, you can additionally pass `configs/qwen0b5hfteacher.yaml`.
+
+Example content of `qwen0b5hfteacher.yaml`:
 
 ```yaml
 train:
@@ -502,7 +510,7 @@ python train.py \
     -c configs/atlasqwen0b5.yaml \
     -c configs/qwen0b5teacher.yaml \
     --train.attention_distillation_stage 2 \
-    --train.data_file data/dclm-10B.bin \
+    --train.data_file data/dclm-10B \
     --train.devices 1
 ```
 
@@ -810,14 +818,14 @@ python run_lm_eval.py -c configs/atlasqwen0b5.yaml \
 
 ```bash
 # 1. After Stage 1 (attention alignment) completes
-STAGE1_CKPT="out/atlas-stage1/rwkv-final.pth"
+STAGE1_CKPT="out/L6-D512-x060-atlas-stage1/rwkv-final.pth"
 
 # Quick sanity check
 python dragon_test.py -c configs/atlasqwen0b5.yaml \
     --train.load_model $STAGE1_CKPT
 
 # 2. After Stage 2 (KL distillation) completes
-STAGE2_CKPT="out/atlas-stage2/rwkv-final.pth"
+STAGE2_CKPT="out/atlas-lmm-0b5-atlas-stage2/rwkv-final.pth"
 
 # Full evaluation
 python run_lm_eval.py -c configs/atlasqwen0b5.yaml \
@@ -953,7 +961,7 @@ model:
 train:
   # Data
   data_type: binidx
-  data_file: data/dclm-10B.bin
+  data_file: data/dclm-10B
   ctx_len: 2048
 
   # Batch
