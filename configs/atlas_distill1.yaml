@@ -10,7 +10,7 @@
 #   - Loss: ||teacher_output - student_output|| at each layer
 
 model:
-  __type__: configs.Transformer_Config
+  __type__: configs.Atlas_Config
   hf_path: Qwen/Qwen2.5-0.5B-Instruct
   ctx_len: 512
   vocab_size: 151936
@@ -19,9 +19,21 @@ model:
   attn_path: atlasattn.AtlasSelfAttention
   attn_classes_path: transformers.models.qwen2.modeling_qwen2.QWEN2_ATTENTION_CLASSES
 
+  # Atlas memory hyperparameters (must match Stage 2 for checkpoint compatibility)
+  use_momentum: true
+  use_omega_gate: true
+  omega_window: 4
+  poly_degree: 2
+  poly_mode: "elementwise"
+  qk_norm: false
+  qkv_conv_kernel: null
+  use_rope: false
+  use_groupnorm: false
+
 train:
   proj_suffix: atlas-stage1
-  train_stage: 3
+  train_stage: 2
+  load_model: "" # Start from scratch (HF model will be loaded)
   load_partial: 1
 
   data_type: "binidx"
@@ -48,4 +60,3 @@ train:
 
   # Stage 1 = Attention Alignment
   attention_distillation_stage: 1
-

@@ -18,13 +18,18 @@ model:
   # Atlas memory configuration
   memory_heads: 14 # 896 / 64
   memory_dim_head: 64
+  # GQA: match Qwen2.5-0.5B-Instruct (14 attention heads, 2 KV heads)
+  # This preserves the teacher's runtime repetition of K/V when present (paper protocol).
+  num_key_value_heads: 2
   use_momentum: true
   omega_window: 4 # Atlas-RNN (OmegaRNNMemoryCell)
   use_omega_gate: true
-  poly_degree: 1
-  poly_mode: "off"
-  qk_norm: true
-  qkv_conv_kernel: null
+  poly_degree: 2 # Default: 2 (탐색: 2 or 3)
+  poly_mode: "elementwise" # Default: elementwise
+  qk_norm: false # Default: false (탐색: false or true)
+  qkv_conv_kernel: null # Default: null (탐색: null or 4)
+  use_rope: false # Default: false (탐색: false or true)
+  use_groupnorm: false # Default: false (탐색: false or true)
 
   # Architecture variant
   atlas_variant: "lmm" # Pure memory, no attention

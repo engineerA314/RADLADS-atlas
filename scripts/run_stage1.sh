@@ -1,10 +1,16 @@
 #!/bin/bash
-# Run RADLADS Stage 1: Attention Alignment
+# Run RADLADS Paper Stage 1: Attention Alignment
+#
+# Paper Stage 1 uses attention_distillation_stage=1 (no separate teacher model).
+# This script uses atlas_distill1.yaml which patches HF Qwen2 with Atlas attention.
+# 
+# Alternative: Use atlasqwen0b5.yaml + distill1.yaml for pure Atlas model
+# (see gcp_test/ scripts for that approach)
 
 set -e
 
 echo "=============================================="
-echo "RADLADS Stage 1: Attention Alignment"
+echo "RADLADS Paper Stage 1: Attention Alignment"
 echo "=============================================="
 
 # Check if data exists
@@ -20,6 +26,7 @@ DEVICES=${2:-1}         # Default: 1 GPU
 echo "Configuration:"
 echo "  Tokens: $TOKENS"
 echo "  Devices: $DEVICES"
+echo "  Config: configs/atlas_distill1.yaml (HF Qwen2 + Atlas patch)"
 echo ""
 
 # Run training
@@ -30,8 +37,8 @@ python3 train.py \
     --train.devices $DEVICES
 
 echo ""
-echo "✅ Stage 1 complete!"
+echo "✅ Paper Stage 1 complete!"
 echo "Output saved to: out/L6-D512-x060-atlas-stage1/"
 echo ""
-echo "Next step:"
+echo "Next step (Paper Stage 2):"
 echo "  bash scripts/run_stage2.sh out/L6-D512-x060-atlas-stage1/rwkv-final.pth"

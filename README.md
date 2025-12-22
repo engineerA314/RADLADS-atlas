@@ -123,16 +123,18 @@ bash scripts/run_stage3.sh out/L6-D512-x060-4/rwkv-final.pth 1024 250000000 1
 python -m pytest tests/ -v
 # Expected: 119 passed, 4 skipped (MAL streaming not impl)
 
-# 2. Create test data (small synthetic dataset)
-python gcp_test/create_test_data.py
-# Creates data/test_data.bin and data/test_data.idx (50K tokens)
+# 2. Create test data for ctx_len=128 (small synthetic dataset)
+# This also prints `export ...` lines, so we eval it to set variables.
+eval "$(python3 gcp_test/create_test_data.py --prefix data/test_data_ctx128 --ctx_len 128 --my_exit_tokens 5000 --print_env --env_prefix TESTDATA128)"
+# Creates data/test_data_ctx128.bin/.idx and exports:
+#   TESTDATA128_DATA_FILE, TESTDATA128_MAGIC_PRIME, ...
 
 # 3. Standard CE Training (no distillation)
 #    Tests: forward/backward through cross-entropy loss
 python train.py -c configs/atlasqwen0b5.yaml \
-    --train.data_file data/test_data \
+    --train.data_file "$TESTDATA128_DATA_FILE" \
     --train.my_exit_tokens 5000 \
-    --train.magic_prime 389 \
+    --train.magic_prime "$TESTDATA128_MAGIC_PRIME" \
     --train.micro_bsz 1 \
     --train.devices 1 \
     --train.attention_distillation_stage -1 \
@@ -143,9 +145,9 @@ python train.py -c configs/atlasqwen0b5.yaml \
 # 4. Stage 2 - Logit KL Divergence (CE only, no teacher for initial test)
 #    Tests: forward/backward through KL divergence loss path
 python train.py -c configs/atlasqwen0b5.yaml \
-    --train.data_file data/test_data \
+    --train.data_file "$TESTDATA128_DATA_FILE" \
     --train.my_exit_tokens 5000 \
-    --train.magic_prime 389 \
+    --train.magic_prime "$TESTDATA128_MAGIC_PRIME" \
     --train.micro_bsz 1 \
     --train.devices 1 \
     --train.attention_distillation_stage 2 \
@@ -157,9 +159,9 @@ python train.py -c configs/atlasqwen0b5.yaml \
 #    Patches HuggingFace Qwen2 model with Atlas attention for alignment
 python train.py \
     -c configs/atlas_distill1.yaml \
-    --train.data_file data/test_data \
+    --train.data_file "$TESTDATA128_DATA_FILE" \
     --train.my_exit_tokens 5000 \
-    --train.magic_prime 389 \
+    --train.magic_prime "$TESTDATA128_MAGIC_PRIME" \
     --train.micro_bsz 1 \
     --train.devices 1 \
     --train.load_model '' \
@@ -172,9 +174,9 @@ python train.py \
     -c configs/atlasqwen0b5.yaml \
     -c configs/qwen0b5hfteacher.yaml \
     -c configs/distill2.yaml \
-    --train.data_file data/test_data \
+    --train.data_file "$TESTDATA128_DATA_FILE" \
     --train.my_exit_tokens 5000 \
-    --train.magic_prime 389 \
+    --train.magic_prime "$TESTDATA128_MAGIC_PRIME" \
     --train.micro_bsz 1 \
     --train.devices 1 \
     --train.load_model ''
@@ -182,36 +184,46 @@ python train.py \
 
 ### Distillation Stages Explained
 
-| Stage          | Config                | Mechanism    | Architecture    | Status       | Notes                      |
-| -------------- | --------------------- | ------------ | --------------- | ------------ | -------------------------- |
-| **No distill** | `atlasqwen0b5.yaml`   | Standard CE  | LMM             | ✅ Validated | Baseline training          |
-| **Stage 1**    | `atlas_distill1.yaml` | HF Patching  | **Independent** | ✅ Validated | Patches Qwen2 model        |
-| **Stage 2**    | `distill2.yaml`       | Teacher KL   | LMM             | ✅ Validated | Requires teacher model     |
-| **Stage 3**    | `distill3*.yaml`      | Long Context | LMM             | ✅ Validated | Progressive 128→192→512... |
+| Stage          | Config                | Mechanism    | Architecture    | Teacher? | Status       | Notes                    |
+| -------------- | --------------------- | ------------ | --------------- | -------- | ------------ | ------------------------ |
+| **No distill** | `atlasqwen0b5.yaml`   | Standard CE  | LMM             | ❌       | ✅ Validated | Baseline training        |
+| **Stage 1**    | `atlas_distill1.yaml` | HF Patching  | **Independent** | ❌       | ✅ Validated | Parallel teacher/student |
+| **Stage 2**    | `distill2.yaml`       | Teacher KL   | LMM             | ✅       | ✅ Validated | Separate teacher model   |
+| **Stage 3**    | `distill3*.yaml`      | Long Context | LMM             | ❌       | ✅ Validated | CE only, no teacher      |
 
 #### Stage Details
 
-**Stage 1: Attention Alignment** (Independent of LMM/MAL)
+**Stage 1: Attention Alignment** (Paper Stage 1)
 
-- Uses `atlasattn.py` to patch **HuggingFace Qwen2** with `AttentionDistillationWrapper`
+- **Config Options**:
+  - `atlas_distill1.yaml` - Production: Patches **HuggingFace Qwen2** with `AttentionDistillationWrapper`
+  - `atlasqwen0b5.yaml` + `distill1.yaml` - Alternative: Pure Atlas model for testing
 - Each layer: Teacher (softmax attention) + Student (Atlas memory) in parallel
-- Loss: `||teacher_output - student_output||`
+- Loss: `||teacher_output - student_output||` (L2 distance)
+- `attention_distillation_stage=1`
 - Output: Checkpoint for Stage 2
-- **Note**: This creates a hybrid model, not pure LMM/MAL
+- **Teacher**: ❌ No separate teacher needed (parallel internal components)
+- **Note**: HF approach creates a hybrid model, not pure LMM/MAL
 
-**Stage 2: Logit KL Divergence** (Atlas-LMM)
+**Stage 2: Logit KL Divergence** (Paper Stage 2, Atlas-LMM)
 
+- **Configs**: `atlasqwen0b5.yaml` + `qwen0b5hfteacher.yaml` + `distill2.yaml`
 - Loads Stage 1 checkpoint into Atlas-LMM architecture
 - Distills teacher logits to student using KL divergence
+- `attention_distillation_stage=2`
 - Full Atlas-LMM model training
+- **Teacher**: ✅ Requires separate teacher model
 
-**Stage 3: Long Context** (Atlas-LMM)
+**Stage 3: Long Context** (Paper Stage 3, Atlas-LMM)
 
+- **Configs**: `atlasqwen0b5.yaml` + `distill3-{ctx}.yaml`
 - **Progressive Training**: Increases context length gradually (e.g., 128 → 192 → 512 → 1024 → 2048)
 - Each step loads the checkpoint from the previous context length
 - `magic_prime` must be recalculated for each context length
-- Continues using teacher for distillation (optional: can use CE-only)
+- `attention_distillation_stage=-1` (standard CE loss)
+- **⚠️ No teacher model needed** — uses regular CE loss only (per paper)
 - Essential for production use with long contexts
+- More memory efficient since only student model is in memory
 
 **GPU Validation Results**:
 
@@ -423,6 +435,24 @@ python train.py -c configs/atlasqwen0b5.yaml \
 ---
 
 ## Training Configurations
+
+### Paper Stage Mapping (Important!)
+
+The RADLADS paper defines a 3-stage distillation process. Here's how the paper stages map to code settings:
+
+| Paper Stage                       | Code Setting                                      | Teacher Required | Loss          | Description                                       |
+| --------------------------------- | ------------------------------------------------- | ---------------- | ------------- | ------------------------------------------------- |
+| **Setup**                         | `train_stage=1`                                   | ❌ No            | -             | Weight initialization only (not a training stage) |
+| **Stage 1** (Attention Alignment) | `attention_distillation_stage=1`                  | ❌ No            | L2 distance   | Align RNN output to softmax attention output      |
+| **Stage 2** (KL Divergence)       | `attention_distillation_stage=2` + teacher config | ✅ Yes           | KL divergence | Distill teacher logits to student                 |
+| **Stage 3** (Long Context)        | `attention_distillation_stage=-1`                 | ❌ No            | CE loss only  | Train on longer context lengths                   |
+
+**⚠️ Important Notes:**
+
+- `train_stage=1` is just for weight initialization, NOT Paper Stage 1!
+- Paper Stage 1 uses `attention_distillation_stage=1` with **no separate teacher** (parallel teacher/student in model)
+- Paper Stage 2 requires a **separate teacher model** via teacher config
+- Paper Stage 3 does NOT need a teacher model (regular CE training on longer contexts)
 
 ### Training Modes
 
@@ -686,11 +716,12 @@ AtlasQwen2Config(
 
 RADLADS uses a multi-stage distillation process. Each stage has different goals and metrics:
 
-| Stage     | Config Value                            | What It Does               | Key Metric                |
-| --------- | --------------------------------------- | -------------------------- | ------------------------- |
-| Stage 0/1 | `attention_distillation_stage=0` or `1` | Attention output alignment | MSE loss (lower = better) |
-| Stage 2   | `attention_distillation_stage=2`        | KL divergence on logits    | KL loss (lower = better)  |
-| Stage 2+3 | `attention_distillation_stage=23`       | Hidden state + KL combined | Combined loss             |
+| Paper Stage | Config Value                            | What It Does               | Teacher? | Key Metric                |
+| ----------- | --------------------------------------- | -------------------------- | -------- | ------------------------- |
+| **Stage 1** | `attention_distillation_stage=0` or `1` | Attention output alignment | ❌ No    | MSE loss (lower = better) |
+| **Stage 2** | `attention_distillation_stage=2`        | KL divergence on logits    | ✅ Yes   | KL loss (lower = better)  |
+| **Stage 3** | `attention_distillation_stage=-1`       | Long context CE training   | ❌ No    | CE loss (lower = better)  |
+| (Variant)   | `attention_distillation_stage=23`       | Hidden state + KL combined | ✅ Yes   | Combined loss             |
 
 ### Monitoring Training (WandB)
 

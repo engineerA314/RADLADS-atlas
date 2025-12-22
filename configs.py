@@ -88,6 +88,9 @@ class Atlas_Config(Transformer_Config):
     poly_mode:str = 'off'
     qk_norm:bool = True
     qkv_conv_kernel:int | None = None
+    # Normalization options (for ablation study)
+    use_groupnorm:bool = False  # Use GroupNorm in attention
+    use_rope:bool = False  # Use Rotary Position Embedding
     # Omega configuration (sliding window context)
     omega_window:int = 4  # Window size for Omega rule (must be >= 2 for proper operation)
     use_omega_gate:bool = True  # Enable learnable omega gate
@@ -225,6 +228,17 @@ def literal_eval(s:str):
         if not isinstance(node, Constant) or type(node.value) not in (int, float, complex):
             raise ValueError()
         return node.value
+
+    # Support common CLI boolean / null literals (the YAML loader already handles these,
+    # but CLI overrides come in as strings).
+    s_strip = s.strip()
+    s_lower = s_strip.lower()
+    if s_lower == "true":
+        return True
+    if s_lower == "false":
+        return False
+    if s_lower == "null":
+        return None
 
     if s == "None":
         return None

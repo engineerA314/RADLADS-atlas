@@ -269,7 +269,9 @@ if __name__ == "__main__":
     teacher_config = None
     if config.train.train_stage > 1:
         teacher_config = config.train.teacher
-        if teacher_config is not None and teacher_config.path != '':
+        # NOTE: Teacher presence is controlled by `train.teacher` itself, not by `train.teacher.path`.
+        # `path` is only for optionally loading teacher weights from a local checkpoint.
+        if teacher_config is not None:
             print("Instantiating teacher model")
             hf_path = teacher_config.model.hf_path
             classname = teacher_config.model.classname
@@ -304,7 +306,13 @@ if __name__ == "__main__":
             if attn_loader is None:
                 # Fallback to rwkv6attn
                 from rwkv6attn import load_and_patch_model_with_attention_replacement as attn_loader
-            model = attn_loader(hf_path, config.model.attn_classes_path, ReplacementSelfAttnType, attention_distillation_stage)
+            # Pass the CLI model config through so HF patching (atlasattn) can see Atlas-specific fields
+            # (e.g., qk_norm / qkv_conv_kernel / use_groupnorm / use_rope) for ablation runs.
+            try:
+                model = attn_loader(hf_path, config.model.attn_classes_path, ReplacementSelfAttnType, attention_distillation_stage, config.model)
+            except TypeError:
+                # Backwards compatibility for loaders that only accept 4 args
+                model = attn_loader(hf_path, config.model.attn_classes_path, ReplacementSelfAttnType, attention_distillation_stage)
         elif classname != '':
             model_classpath = f'models.{classname}.Model_{classname}'
             model_factory = locate(model_classpath)

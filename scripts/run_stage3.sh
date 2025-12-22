@@ -1,10 +1,14 @@
 #!/bin/bash
 # Run RADLADS Stage 3: Long Context Mid-Training
+# Paper Stage 3: CE loss only, NO teacher model required
 
 set -e
 
 echo "=============================================="
 echo "RADLADS Stage 3: Long Context Mid-Training"
+echo "=============================================="
+echo "Paper Stage 3: CE loss only (no teacher model)"
+echo "attention_distillation_stage=-1"
 echo "=============================================="
 
 # Check arguments
@@ -50,14 +54,15 @@ echo "  Devices: $DEVICES"
 echo ""
 
 # Run training
+# Note: Stage 3 does NOT use teacher model (CE loss only, per paper)
 python3 train.py \
     -c configs/atlasqwen0b5.yaml \
-    -c configs/qwen0b5hfteacher.yaml \
     -c "$CONFIG_FILE" \
     --train.data_file data/dclm-10B \
     --train.my_exit_tokens $TOKENS \
     --train.devices $DEVICES \
     --train.load_model "$STAGE2_CKPT" \
+    --train.attention_distillation_stage -1 \
     --model.ctx_len $CTX_LEN
 
 echo ""

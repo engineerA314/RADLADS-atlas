@@ -43,18 +43,48 @@ class AtlasSelfAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = config.hidden_size // config.num_attention_heads
         
-        # Get omega configuration from config if available
+        # Atlas / ablation configuration from config if available
+        # NOTE: For HF patching, these fields are injected into the HF config
+        # in load_and_patch_model_with_attention_replacement(...).
         omega_window = getattr(config, 'omega_window', 4)
         use_omega_gate = getattr(config, 'use_omega_gate', True)
+        use_momentum = getattr(config, 'use_momentum', True)
+        poly_degree = getattr(config, 'poly_degree', 2)
+        poly_mode = getattr(config, 'poly_mode', 'elementwise')
+        qk_norm = getattr(config, 'qk_norm', False)
+        qkv_conv_kernel = getattr(config, 'qkv_conv_kernel', None)
+        use_rope = getattr(config, 'use_rope', False)
+        use_groupnorm = getattr(config, 'use_groupnorm', False)
+
+        # GQA / RoPE params (if present in HF config)
+        # Note: num_key_value_heads must be <= heads and must divide heads.
+        # Some unit-test MockConfig values violate this (e.g. heads=2, num_key_value_heads=4),
+        # so we fall back to "no GQA" in that case.
+        num_key_value_heads = getattr(config, 'num_key_value_heads', None)
+        if not isinstance(num_key_value_heads, int) or num_key_value_heads <= 0:
+            num_key_value_heads = None
+        elif num_key_value_heads > self.num_heads or (self.num_heads % num_key_value_heads) != 0:
+            num_key_value_heads = None
+        rope_theta = getattr(config, 'rope_theta', 10000.0)
+        max_position_embeddings = getattr(config, 'max_position_embeddings', 2048)
         
         # Atlas memory (uses OmegaRNNMemoryCell internally, handles its own projections)
         self.memory = RNNMemory(
             dim=self.hidden_size,
             dim_head=self.head_dim,
             heads=self.num_heads,
-            use_momentum=True,
+            num_key_value_heads=num_key_value_heads,
+            use_momentum=use_momentum,
             omega_window=omega_window,
             use_omega_gate=use_omega_gate,
+            poly_degree=poly_degree,
+            poly_mode=poly_mode,
+            qk_norm=qk_norm,
+            qkv_conv_kernel=qkv_conv_kernel,
+            use_rope=use_rope,
+            rope_theta=rope_theta,
+            max_position_embeddings=max_position_embeddings,
+            use_groupnorm=use_groupnorm,
         )
         
         # Layer-specific state storage (for streaming)
@@ -113,7 +143,9 @@ class AtlasSelfAttention(nn.Module):
             self._memory_state = new_state
         
         # Return format matching HF: (hidden_states, attn_weights, past_key_value)
-        return output, None, None
+        # Return: (hidden_states, attention_weights) matching HF Qwen2DecoderLayer expectations
+        # attention_weights is None since we don't use attention
+        return output, None
 
 
 class AttentionDistillationWrapper(nn.Module):
@@ -187,6 +219,7 @@ def load_and_patch_model_with_attention_replacement(
     attn_classes_path: str,
     ReplacementSelfAttentionType: Callable,
     attention_distillation_stage: int,
+    atlas_model_config: Any = None,
 ):
     """
     Load HuggingFace model and patch attention layers for distillation.
@@ -201,6 +234,25 @@ def load_and_patch_model_with_attention_replacement(
         Patched HuggingFace model
     """
     model_config = AutoConfig.from_pretrained(model_path)
+
+    # Inject Atlas-specific knobs into the HF config so AtlasSelfAttention can see them.
+    # This is required for WITH_ALL_ABLATION runs: Stage 1 must create the same optional
+    # submodules (qk_norm, conv, groupnorm, rope) as Stage 2 expects.
+    if atlas_model_config is not None:
+        for k in [
+            # Omega / core Atlas
+            'omega_window', 'use_omega_gate', 'use_momentum',
+            # Ablation knobs
+            'poly_degree', 'poly_mode', 'qk_norm', 'qkv_conv_kernel', 'use_rope', 'use_groupnorm',
+            # Optional RoPE params
+            'rope_theta', 'max_position_embeddings',
+        ]:
+            if hasattr(atlas_model_config, k):
+                try:
+                    setattr(model_config, k, getattr(atlas_model_config, k))
+                except Exception:
+                    # HF configs should allow arbitrary fields, but keep this robust.
+                    pass
     
     # Handle Qwen-specific config
     if 'Qwen' in model_path:

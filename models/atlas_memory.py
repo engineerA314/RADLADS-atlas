@@ -195,10 +195,10 @@ class RNNMemoryCell(Module):
         dim_head: int = 64,
         heads: int = 1,
         use_momentum: bool = True,
-        poly_degree: int = 1,
-        poly_mode: str = 'off',
-        qk_norm: bool = True,
-        qkv_conv_kernel: int | None = 4,
+        poly_degree: int = 2,  # Default: 2
+        poly_mode: str = 'elementwise',  # Default: elementwise
+        qk_norm: bool = False,  # Default: False
+        qkv_conv_kernel: int | None = None,  # Default: None
         use_accelerated_scan: bool = False,
     ):
         super().__init__()
@@ -433,10 +433,10 @@ class OmegaRNNMemoryCell(Module):
         omega_window: int = 1,
         use_omega_gate: bool = True,
         use_momentum: bool = True,
-        poly_degree: int = 1,
-        poly_mode: str = 'off',
-        qk_norm: bool = True,
-        qkv_conv_kernel: int | None = 4,
+        poly_degree: int = 2,  # Default: 2
+        poly_mode: str = 'elementwise',  # Default: elementwise
+        qk_norm: bool = False,  # Default: False
+        qkv_conv_kernel: int | None = None,  # Default: None
         use_rope: bool = False,  # ROPE option
         rope_theta: float = 10000.0,  # ROPE base frequency
         max_position_embeddings: int = 2048,  # ROPE max positions
@@ -763,12 +763,12 @@ class RNNMemory(Module):
         heads: int = 1,
         num_key_value_heads: int | None = None,  # GQA
         use_momentum: bool = True,
-        poly_degree: int = 1,
-        poly_mode: str = 'off',
+        poly_degree: int = 2,  # Default: 2
+        poly_mode: str = 'elementwise',  # Default: elementwise
         omega_window: int = 4,  # Changed default from 1 to 4
         use_omega_gate: bool = True,  # Changed default from False to True
-        qk_norm: bool = True,
-        qkv_conv_kernel: int | None = 4,
+        qk_norm: bool = False,  # Default: False
+        qkv_conv_kernel: int | None = None,  # Default: None
         use_rope: bool = False,  # ROPE option
         rope_theta: float = 10000.0,
         max_position_embeddings: int = 2048,

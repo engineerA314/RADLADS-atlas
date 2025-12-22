@@ -1,26 +1,30 @@
 #!/bin/bash
-# Run RADLADS Stage 2: Logit KL Divergence
+# Run RADLADS Paper Stage 2: Logit KL Divergence
+#
+# Paper Stage 2 uses attention_distillation_stage=2 with a separate teacher model.
 
 set -e
 
 echo "=============================================="
-echo "RADLADS Stage 2: Logit KL Divergence"
+echo "RADLADS Paper Stage 2: Logit KL Divergence"
 echo "=============================================="
 
 # Check arguments
 if [ -z "$1" ]; then
-    echo "Usage: bash scripts/run_stage2.sh <stage1_checkpoint> [tokens] [devices]"
+    echo "Usage: bash scripts/run_stage2.sh <paper_stage1_checkpoint> [tokens] [devices]"
     echo "Example: bash scripts/run_stage2.sh out/atlas-stage1/rwkv-final.pth 500000000 1"
+    echo ""
+    echo "Note: <paper_stage1_checkpoint> should be from Paper Stage 1 (Attention Alignment)"
     exit 1
 fi
 
-STAGE1_CKPT=$1
+PAPER_STAGE1_CKPT=$1
 TOKENS=${2:-500000000}  # Default: 500M tokens
 DEVICES=${3:-1}         # Default: 1 GPU
 
 # Check if checkpoint exists
-if [ ! -f "$STAGE1_CKPT" ]; then
-    echo "❌ Checkpoint not found: $STAGE1_CKPT"
+if [ ! -f "$PAPER_STAGE1_CKPT" ]; then
+    echo "❌ Checkpoint not found: $PAPER_STAGE1_CKPT"
     exit 1
 fi
 
@@ -31,7 +35,7 @@ if [ ! -f "data/dclm-10B.idx" ] || [ ! -f "data/dclm-10B.bin" ]; then
 fi
 
 echo "Configuration:"
-echo "  Stage 1 Checkpoint: $STAGE1_CKPT"
+echo "  Paper Stage 1 Checkpoint: $PAPER_STAGE1_CKPT"
 echo "  Tokens: $TOKENS"
 echo "  Devices: $DEVICES"
 echo ""
@@ -44,11 +48,11 @@ python3 train.py \
     --train.data_file data/dclm-10B \
     --train.my_exit_tokens $TOKENS \
     --train.devices $DEVICES \
-    --train.load_model "$STAGE1_CKPT"
+    --train.load_model "$PAPER_STAGE1_CKPT"
 
 echo ""
-echo "✅ Stage 2 complete!"
+echo "✅ Paper Stage 2 complete!"
 echo "Output saved to: out/L6-D512-x060-2/"
 echo ""
-echo "Next step (optional, for long context):"
+echo "Next step (Paper Stage 3 - Long Context):"
 echo "  bash scripts/run_stage3.sh out/L6-D512-x060-2/rwkv-final.pth 2048"

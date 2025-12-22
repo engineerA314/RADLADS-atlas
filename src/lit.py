@@ -15,6 +15,13 @@ import torch.distributed as dist
 from safetensors.torch import load_file
 from torch.utils.data import Dataset, DataLoader    
 
+# Optional dependency (only required for DeepSpeed strategies, especially ZeRO-3).
+# Keep import safe so CPU-only / non-deepspeed environments can still import this module.
+try:
+    import deepspeed  # type: ignore
+except Exception:  # pragma: no cover
+    deepspeed = None
+
 from configs import TrainerCLI_Config, Model_Config, Transformer_Config, Train_Config
 
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig, FullOptimStateDictConfig
@@ -109,16 +116,37 @@ class LightningModelWrapper(pl.LightningModule):
 
         # we require that the module supports configure_model for this code to work well
         # HuggingFace models don't have configure_model, so skip for them
+        is_hf_like = not hasattr(model, 'configure_model')
         if hasattr(model, 'configure_model'):
-            #with self.trainer.init_module(empty_init=True): # FIXME - we can probably use this instead of meta then convert to dtype then to_empty
-            with init_on_meta_device():
+            # NOTE:
+            # - For most strategies we build on meta to save peak init memory, then materialize with to_empty().
+            # - For DeepSpeed ZeRO-3, parameter partitioning happens during module init, and DeepSpeed will try
+            #   to move newly-created Parameters to GPU shards. Meta tensors have no backing storage, so this
+            #   fails with: "Cannot copy out of meta tensor; no data!".
+            use_zero3 = self.config.train is not None and ('deepspeed_stage_3' in self.config.train.strategy)
+            if use_zero3:
                 model.configure_model()
+            else:
+                #with self.trainer.init_module(empty_init=True): # FIXME - we can probably use this instead of meta then convert to dtype then to_empty
+                with init_on_meta_device():
+                    model.configure_model()
 
         dtype_map = {"bf16-true":torch.bfloat16, "bf16-mixed":torch.bfloat16, "16-true":torch.float16, "16-mixed":torch.float16, "32-true":torch.float32}
         dtype = dtype_map[self.trainer.precision]
 
         print("Moving model to dtype ", dtype)
+        # IMPORTANT:
+        # - For our own models (supporting configure_model), we build on meta and then materialize with to_empty().
+        # - For HuggingFace-style models (no configure_model), parameters are already materialized (e.g., from_pretrained()).
+        #   Calling to_empty() would wipe pretrained weights, leaving uninitialized garbage which can produce NaNs immediately.
+        if is_hf_like:
+            model.to(device=self.device, dtype=dtype)
+            return
         model.to(dtype=dtype)
+        # DeepSpeed ZeRO-3: do NOT to_empty() (and do not rely on meta init above).
+        # DeepSpeed needs real storage during partitioning; parameters are already materialized.
+        if self.config.train is not None and ('deepspeed_stage_3' in self.config.train.strategy):
+            return
         if 'fsdp' in self.config.train.strategy:
             if self.trainer.global_rank == 0:
                 if do_reset:
@@ -210,9 +238,13 @@ class LightningModelWrapper(pl.LightningModule):
                 if save_dict is None:
                     save_dict = {}
                 #print("saving prefix", prefix)
+                if deepspeed is None:
+                    raise ImportError("DeepSpeed is required for strategy=deepspeed_stage_3 but could not be imported.")
                 with deepspeed.zero.GatheredParameters(list(module.parameters(recurse=False)), modifier_rank=0):
                     if deepspeed.comm.get_rank() == 0:
-                        for n, p in module.named_parameters():
+                        # Important: only save this module's direct params here.
+                        # Child module params are handled by recursion below.
+                        for n, p in module.named_parameters(recurse=False):
                             save_dict[prefix + n] = p.detach().cpu()
 
                 for name, child in module._modules.items():
@@ -223,13 +255,63 @@ class LightningModelWrapper(pl.LightningModule):
 
             save_dict = save(model)
 
-        # remove teacher attentions and move student attentions to self_attention after stage 2
+        # Convert Stage 1 checkpoint (HF patching) to Stage 2/3 format (Pure LMM)
+        # Stage 1: HF structure with wrapper: model.layers.X.self_attn.memory.*
+        # Stage 2/3: Pure LMM structure: model.layers.X.memory.*
+        # Also: post_attention_layernorm → post_memory_layernorm
         if config.train.attention_distillation_stage == 1:
+            # Stage 1 saving: This checkpoint will be loaded by Stage 2 (Pure LMM)
+            # Need to remap HF structure → Pure LMM structure
+            new_save_dict = {}
             for k in list(save_dict.keys()):
+                # Remove teacher attention weights (not needed in Stage 2+)
                 if '.teacher_attn.' in k:
-                    del save_dict[k]
-                elif '.student_attn.' in k:
-                    save_dict[k.replace('.student_attn.', '.')] = save_dict.pop(k)
+                    continue
+                
+                k_new = k
+                
+                # Remove student_attn wrapper (from AttentionDistillationWrapper)
+                if '.student_attn.' in k_new:
+                    k_new = k_new.replace('.student_attn.', '.')
+                
+                # Convert HF structure to Pure LMM structure
+                # model.layers.X.self_attn.memory.* → model.layers.X.memory.*
+                if '.self_attn.memory.' in k_new:
+                    k_new = k_new.replace('.self_attn.memory.', '.memory.')
+                
+                # post_attention_layernorm → post_memory_layernorm
+                if 'post_attention_layernorm' in k_new:
+                    k_new = k_new.replace('post_attention_layernorm', 'post_memory_layernorm')
+                    
+                new_save_dict[k_new] = save_dict[k]
+            
+            save_dict = new_save_dict
+        elif config.model.hf_path != '':
+            # Stage 2/3 with HF-patched checkpoint: Also remap HF structure → Pure LMM structure
+            new_save_dict = {}
+            for k in list(save_dict.keys()):
+                # Remove teacher attention weights
+                if '.teacher_attn.' in k:
+                    continue
+                
+                k_new = k
+                    
+                # Remove student_attn wrapper (from AttentionDistillationWrapper)
+                if '.student_attn.' in k_new:
+                    k_new = k_new.replace('.student_attn.', '.')
+                    
+                # Convert HF patching format to Pure LMM format
+                # self_attn.memory.* → memory.*
+                if '.self_attn.memory.' in k_new:
+                    k_new = k_new.replace('.self_attn.memory.', '.memory.')
+                    
+                # post_attention_layernorm → post_memory_layernorm
+                if 'post_attention_layernorm' in k_new:
+                    k_new = k_new.replace('post_attention_layernorm', 'post_memory_layernorm')
+                    
+                new_save_dict[k_new] = save_dict[k]
+            
+            save_dict = new_save_dict
 
         if self.trainer.is_global_zero:
             torch.save(save_dict, path)
@@ -239,7 +321,9 @@ class LightningModelWrapper(pl.LightningModule):
         ckpt_path = config.train.load_model
         if ckpt_path != '':
             self.load_specific_model_weights(self.model, ckpt_path)
-            self.model.set_grads()
+            # Set gradients based on training stage (only for custom models with set_grads method)
+            if hasattr(self.model, 'set_grads'):
+                self.model.set_grads()
         
         if self.teacher is not None and config.train.teacher is not None:
            teacher_ckpt_path = config.train.teacher.path
@@ -623,6 +707,25 @@ class LightningModelWrapper(pl.LightningModule):
                     else:
                         teacher_logits = teacher_results.logits
                     flat_teacher_logits = teacher_logits.view(-1, teacher_logits.size(-1))
+                    
+                    # ALWAYS debug batch 0 to catch NaN issues early
+                    if batch_idx == 0:
+                        s_nonfinite = (~torch.isfinite(flat_student_logits)).sum().item()
+                        t_nonfinite = (~torch.isfinite(flat_teacher_logits)).sum().item()
+                        if s_nonfinite > 0 or t_nonfinite > 0:
+                            print(f"⚠️  NaN/Inf detected in batch 0 BEFORE KL calculation:")
+                            print(f"   Student logits: {s_nonfinite}/{flat_student_logits.numel()} non-finite")
+                            if s_nonfinite > 0:
+                                s_finite_mask = torch.isfinite(flat_student_logits)
+                                if s_finite_mask.any():
+                                    print(f"      Finite student range: [{flat_student_logits[s_finite_mask].min():.4f}, {flat_student_logits[s_finite_mask].max():.4f}]")
+                            print(f"   Teacher logits: {t_nonfinite}/{flat_teacher_logits.numel()} non-finite")
+                            if t_nonfinite > 0:
+                                t_finite_mask = torch.isfinite(flat_teacher_logits)
+                                if t_finite_mask.any():
+                                    print(f"      Finite teacher range: [{flat_teacher_logits[t_finite_mask].min():.4f}, {flat_teacher_logits[t_finite_mask].max():.4f}]")
+                        else:
+                            print(f"✅ Batch 0: Student logits range=[{flat_student_logits.min():.4f}, {flat_student_logits.max():.4f}], Teacher logits range=[{flat_teacher_logits.min():.4f}, {flat_teacher_logits.max():.4f}]")
                 if not chunk_loss_calcs:
                     distillation_loss = F.kl_div(
                         F.log_softmax(flat_student_logits, dim=-1),

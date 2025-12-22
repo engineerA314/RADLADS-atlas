@@ -261,7 +261,7 @@ class AttentionDistillationWrapper(nn.Module):
 
         return (teacher_outputs[0], special_attn_loss, ) + teacher_outputs[2:]
 
-def load_and_patch_model_with_attention_replacement(model_path:str, attn_classes_path:str, ReplacementSelfAttentionType:Callable, attention_distillation_stage:int):
+def load_and_patch_model_with_attention_replacement(model_path:str, attn_classes_path:str, ReplacementSelfAttentionType:Callable, attention_distillation_stage:int, atlas_model_config=None):
     model_config = AutoConfig.from_pretrained(model_path)
 
     # FIXME - hardcoded for now, but it'd be great if we could specify this in data somewhere per model type (or even analyze the weights to see)

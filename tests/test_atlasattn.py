@@ -1,5 +1,7 @@
 """
-TDD Tests for atlasattn.py - Atlas Attention for RADLADS Stage 1 Distillation.
+TDD Tests for atlasattn.py - Atlas Attention for Paper Stage 1 (Attention Alignment).
+
+Paper Stage 1 uses attention_distillation_stage=1 with parallel teacher/student in model.
 
 These tests verify:
 - AtlasSelfAttention: HuggingFace attention interface compatibility
@@ -101,18 +103,17 @@ class TestAtlasSelfAttention:
         """Test forward pass output shape."""
         attn = AtlasSelfAttention(mock_config, layer_idx=0)
         
-        output, attn_weights, past_kv = attn(sample_input)
+        output, attn_weights = attn(sample_input)
         
         assert output.shape == sample_input.shape
         assert attn_weights is None
-        assert past_kv is None
     
     def test_forward_hf_interface(self, mock_config, sample_input):
         """Test forward pass matches HuggingFace attention interface."""
         attn = AtlasSelfAttention(mock_config, layer_idx=0)
         
         # HuggingFace attention call with all optional args
-        output, attn_weights, past_kv = attn(
+        output, attn_weights = attn(
             hidden_states=sample_input,
             attention_mask=None,
             position_ids=None,
@@ -125,7 +126,6 @@ class TestAtlasSelfAttention:
         
         assert output.shape == sample_input.shape
         assert attn_weights is None
-        assert past_kv is None
     
     def test_forward_training_mode(self, mock_config, sample_input):
         """Test forward in training mode creates fresh state each time."""
@@ -133,11 +133,11 @@ class TestAtlasSelfAttention:
         attn.train()
         
         # First forward
-        output1, _, _ = attn(sample_input)
+        output1, _ = attn(sample_input)
         state1 = attn._memory_state
         
         # Second forward (should not reuse state in training)
-        output2, _, _ = attn(sample_input)
+        output2, _ = attn(sample_input)
         
         # In training mode, outputs should be same (fresh state each time)
         assert torch.allclose(output1, output2, atol=1e-5)
@@ -152,14 +152,14 @@ class TestAtlasSelfAttention:
         
         # First forward with full sequence
         x1 = torch.randn(batch_size, 4, hidden_size)
-        output1, _, _ = attn(x1, use_cache=True)
+        output1, _ = attn(x1, use_cache=True)
         
         # State should be stored
         assert attn._memory_state is not None
         
         # Second forward with new token
         x2 = torch.randn(batch_size, 1, hidden_size)
-        output2, _, _ = attn(x2, use_cache=True)
+        output2, _ = attn(x2, use_cache=True)
         
         # Output should have correct shape
         assert output2.shape == x2.shape
@@ -170,7 +170,7 @@ class TestAtlasSelfAttention:
         attn.train()
         
         sample_input.requires_grad_(True)
-        output, _, _ = attn(sample_input)
+        output, _ = attn(sample_input)
         
         # Backward pass
         loss = output.sum()
@@ -186,7 +186,7 @@ class TestAtlasSelfAttention:
         
         for seq_len in [1, 4, 16, 32]:
             x = torch.randn(2, seq_len, mock_config.hidden_size)
-            output, _, _ = attn(x)
+            output, _ = attn(x)
             assert output.shape == x.shape
     
     def test_multiple_layers(self, mock_config, sample_input):
@@ -195,7 +195,7 @@ class TestAtlasSelfAttention:
         
         x = sample_input
         for i, layer in enumerate(layers):
-            output, _, _ = layer(x)
+            output, _ = layer(x)
             assert output.shape == x.shape
             x = output
 
@@ -264,7 +264,7 @@ class TestAttentionDistillationWrapper:
         wrapper_output, _ = wrapper(sample_input)
         
         # Get student output directly
-        student_output, _, _ = wrapper.student_attn(sample_input)
+        student_output, _ = wrapper.student_attn(sample_input)
         
         # They should match
         assert torch.allclose(wrapper_output, student_output, atol=1e-5)
@@ -512,35 +512,35 @@ class TestEdgeCases:
         """Test with batch size 1."""
         attn = AtlasSelfAttention(mock_config, layer_idx=0)
         x = torch.randn(1, 8, mock_config.hidden_size)
-        output, _, _ = attn(x)
+        output, _ = attn(x)
         assert output.shape == x.shape
     
     def test_sequence_length_one(self, mock_config):
         """Test with sequence length 1."""
         attn = AtlasSelfAttention(mock_config, layer_idx=0)
         x = torch.randn(2, 1, mock_config.hidden_size)
-        output, _, _ = attn(x)
+        output, _ = attn(x)
         assert output.shape == x.shape
     
     def test_large_batch(self, tiny_config):
         """Test with large batch size."""
         attn = AtlasSelfAttention(tiny_config, layer_idx=0)
         x = torch.randn(64, 4, tiny_config.hidden_size)
-        output, _, _ = attn(x)
+        output, _ = attn(x)
         assert output.shape == x.shape
     
     def test_long_sequence(self, tiny_config):
         """Test with longer sequence."""
         attn = AtlasSelfAttention(tiny_config, layer_idx=0)
         x = torch.randn(2, 128, tiny_config.hidden_size)
-        output, _, _ = attn(x)
+        output, _ = attn(x)
         assert output.shape == x.shape
     
     def test_bfloat16(self, tiny_config):
         """Test with bfloat16 precision."""
         attn = AtlasSelfAttention(tiny_config, layer_idx=0).to(torch.bfloat16)
         x = torch.randn(2, 8, tiny_config.hidden_size, dtype=torch.bfloat16)
-        output, _, _ = attn(x)
+        output, _ = attn(x)
         assert output.shape == x.shape
         assert output.dtype == torch.bfloat16
     
@@ -548,7 +548,7 @@ class TestEdgeCases:
         """Test with float16 precision."""
         attn = AtlasSelfAttention(tiny_config, layer_idx=0).to(torch.float16)
         x = torch.randn(2, 8, tiny_config.hidden_size, dtype=torch.float16)
-        output, _, _ = attn(x)
+        output, _ = attn(x)
         assert output.shape == x.shape
         assert output.dtype == torch.float16
     
@@ -558,7 +558,7 @@ class TestEdgeCases:
         device = torch.device("cuda")
         attn = AtlasSelfAttention(tiny_config, layer_idx=0).to(device)
         x = torch.randn(2, 8, tiny_config.hidden_size, device=device)
-        output, _, _ = attn(x)
+        output, _ = attn(x)
         assert output.shape == x.shape
         assert output.device.type == device.type  # Compare device type, not exact device object
     

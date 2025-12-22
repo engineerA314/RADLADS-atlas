@@ -79,11 +79,20 @@ def config_to_atlas_config(config) -> AtlasConfig:
         rms_norm_eps=getattr(model_cfg, 'rms_norm_eps', 1e-6),
         memory_heads=memory_heads,
         memory_dim_head=memory_dim_head,
+        num_key_value_heads=getattr(model_cfg, 'num_key_value_heads', None),
         use_momentum=getattr(model_cfg, 'use_momentum', True),
+        omega_window=getattr(model_cfg, 'omega_window', 4),
+        use_omega_gate=getattr(model_cfg, 'use_omega_gate', True),
         poly_degree=getattr(model_cfg, 'poly_degree', 1),
         poly_mode=getattr(model_cfg, 'poly_mode', 'off'),
         qk_norm=getattr(model_cfg, 'qk_norm', True),
         qkv_conv_kernel=getattr(model_cfg, 'qkv_conv_kernel', None),
+        use_rope=getattr(model_cfg, 'use_rope', False),
+        rope_theta=getattr(model_cfg, 'rope_theta', 10000.0),
+        max_position_embeddings=getattr(model_cfg, 'max_position_embeddings', 2048),
+        use_groupnorm=getattr(model_cfg, 'use_groupnorm', False),
+        atlas_variant=getattr(model_cfg, 'atlas_variant', 'lmm'),
+        sliding_window=getattr(model_cfg, 'sliding_window', 512),
         ctx_len=model_cfg.ctx_len,
         vocab_padding_idx=getattr(model_cfg, 'vocab_padding_idx', None),
         tie_word_embeddings=getattr(model_cfg, 'tie_word_embeddings', True),
@@ -305,7 +314,78 @@ class Model_atlasqwen2(nn.Module):
         pass
     
     def set_grads(self):
-        """Set which parameters require gradients (for distillation stages)."""
-        # For now, all parameters are trainable
-        # Can be extended for distillation-specific freezing
-        pass
+        """
+        Set which parameters require gradients based on training stage.
+        
+        Paper Stage 1 (attention_distillation_stage=1): Train only Atlas memory parameters
+            - Freeze: embeddings, lm_head, MLP layers
+            - Train: All OmegaRNNMemoryCell parameters (Q/K/V, gates, conv, norms)
+        
+        Paper Stage 2/3 (attention_distillation_stage != 1): Train everything
+            - Paper Stage 2: All params with teacher KL loss
+            - Paper Stage 3: All params with CE loss only
+        """
+        train_config = self.config.train
+        if train_config is None:
+            return
+        
+        if train_config.attention_distillation_stage == 1:
+            # Paper Stage 1: Only train memory parameters
+            print("Paper Stage 1 (Attention Alignment): Freezing all parameters except Atlas memory cells")
+            self.requires_grad_(False)
+            
+            # Unfreeze all Atlas memory parameters in each layer
+            for layer_idx, layer in enumerate(self.model.layers):
+                # RNNMemory is a wrapper around the actual cell
+                memory_cell = layer.memory.cell if hasattr(layer.memory, 'cell') else layer.memory
+                print(f"  Layer {layer_idx}: Unfreezing Atlas memory cell")
+                
+                # Core projections (Q/K/V + output)
+                memory_cell.to_q.requires_grad_(True)
+                memory_cell.to_k.requires_grad_(True)
+                memory_cell.to_v.requires_grad_(True)
+                memory_cell.to_out.requires_grad_(True)
+                
+                # Learned gates (lr, decay, momentum, omega_gate)
+                memory_cell.to_lr.requires_grad_(True)
+                memory_cell.to_decay.requires_grad_(True)
+                if memory_cell.use_momentum and hasattr(memory_cell, 'to_momentum'):
+                    memory_cell.to_momentum.requires_grad_(True)
+                if hasattr(memory_cell, 'use_omega_gate') and memory_cell.use_omega_gate and hasattr(memory_cell, 'to_omega_gate'):
+                    memory_cell.to_omega_gate.requires_grad_(True)
+                
+                # Normalizations (pre_norm, q_norm, k_norm, groupnorm)
+                memory_cell.pre_norm.requires_grad_(True)
+                if hasattr(memory_cell, 'q_norm') and isinstance(memory_cell.q_norm, nn.Module):
+                    memory_cell.q_norm.requires_grad_(True)
+                if hasattr(memory_cell, 'k_norm') and isinstance(memory_cell.k_norm, nn.Module):
+                    memory_cell.k_norm.requires_grad_(True)
+                if hasattr(memory_cell, 'groupnorm') and memory_cell.groupnorm is not None:
+                    memory_cell.groupnorm.requires_grad_(True)
+                
+                # Optional conv layers (q_conv, k_conv, v_conv)
+                if hasattr(memory_cell, 'q_conv') and memory_cell.q_conv is not None:
+                    memory_cell.q_conv.requires_grad_(True)
+                if hasattr(memory_cell, 'k_conv') and memory_cell.k_conv is not None:
+                    memory_cell.k_conv.requires_grad_(True)
+                if hasattr(memory_cell, 'v_conv') and memory_cell.v_conv is not None:
+                    memory_cell.v_conv.requires_grad_(True)
+                
+                # Polynomial feature map (if it has learnable params)
+                if hasattr(memory_cell, 'phi') and hasattr(memory_cell.phi, 'proj'):
+                    # proj is a buffer, not a parameter, so skip
+                    pass
+                
+                # ROPE (rotary_emb) - usually has no learnable params, but check
+                if hasattr(memory_cell, 'rotary_emb') and memory_cell.rotary_emb is not None:
+                    if hasattr(memory_cell.rotary_emb, 'parameters'):
+                        for p in memory_cell.rotary_emb.parameters():
+                            p.requires_grad_(True)
+            
+            print("  Paper Stage 1 gradient setup complete")
+        
+        else:
+            # Paper Stage 2/3: Train everything
+            stage_name = "Paper Stage 2 (KL Divergence)" if train_config.attention_distillation_stage == 2 else "Paper Stage 3 (Long Context CE)"
+            print(f"{stage_name}: Training all parameters")
+            self.requires_grad_(True)
