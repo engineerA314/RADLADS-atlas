@@ -22,6 +22,7 @@ from typing import NamedTuple
 from functools import partial
 
 import math
+import warnings
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
@@ -200,6 +201,7 @@ class RNNMemoryCell(Module):
         qk_norm: bool = False,  # Default: False
         qkv_conv_kernel: int | None = None,  # Default: None
         use_accelerated_scan: bool = False,
+        scan_chunk_len: int | None = None,
     ):
         super().__init__()
         self.dim = dim
@@ -207,8 +209,19 @@ class RNNMemoryCell(Module):
         self.heads = heads
         self.use_momentum = use_momentum
         self.qkv_conv_kernel = qkv_conv_kernel
+        self.scan_chunk_len = scan_chunk_len
         
-        # Associative scan for parallel computation (use_accelerated=True requires Triton)
+        # Associative scan for parallel computation (use_accelerated=True prefers Triton).
+        # IMPORTANT: assoc-scan imports `accelerated_scan.triton` lazily inside forward(),
+        # so we proactively validate availability here to avoid runtime crashes.
+        if use_accelerated_scan:
+            try:
+                import accelerated_scan.triton  # noqa: F401
+            except Exception as e:
+                warnings.warn(
+                    f"accelerated_scan.triton unavailable; disabling accelerated scan. Error: {e}"
+                )
+                use_accelerated_scan = False
         self.assoc_scan = AssocScan(use_accelerated=use_accelerated_scan)
         
         dim_inner = dim_head * heads
@@ -290,6 +303,146 @@ class RNNMemoryCell(Module):
         if not exists(state):
             state = self.init_state(batch, x.device, x.dtype)
         
+        # Chunked scan: reduces peak memory by computing [BH, chunk, d, d] tensors per chunk
+        # instead of materializing them for the entire sequence at once.
+        chunk_len = self.scan_chunk_len
+        if exists(chunk_len) and seq_len > chunk_len:
+            if exists(self.q_conv) or exists(self.k_conv) or exists(self.v_conv):
+                raise NotImplementedError(
+                    "scan_chunk_len is not supported with qkv_conv_kernel > 1 (conv mixes across chunk boundaries)."
+                )
+            outs: list[Tensor] = []
+            cur_state = state
+            # Preserve current (unchunked) semantics for g: use a fixed reference state from the start of the call.
+            S_ref = cur_state.S
+            for start in range(0, seq_len, chunk_len):
+                end = min(seq_len, start + chunk_len)
+                out, cur_state = self._forward_impl(x[:, start:end], cur_state, S_ref=S_ref)
+                outs.append(out)
+            return torch.cat(outs, dim=1), cur_state
+
+        return self._forward_impl(x, state, S_ref=state.S)
+
+    def _forward_impl(
+        self,
+        x: Tensor,
+        state: RNNMemState,
+        *,
+        S_ref: Tensor,
+    ) -> tuple[Tensor, RNNMemState]:
+        batch, seq_len, _ = x.shape
+
+        d = self.dim_head
+        BH = batch * self.heads
+        
+        # Pre-norm + activation
+        x = self.activation(self.pre_norm(x))
+
+        q_in, k_in, v_in = x, x, x
+
+        # Optional depthwise conv
+        if exists(self.q_conv):
+            q_in = self.q_conv(q_in.transpose(1, 2)).transpose(1, 2)
+        if exists(self.k_conv):
+            k_in = self.k_conv(k_in.transpose(1, 2)).transpose(1, 2)
+        if exists(self.v_conv):
+            v_in = self.v_conv(v_in.transpose(1, 2)).transpose(1, 2)
+        
+        # Project to Q, K, V and split heads: [batch, heads, seq, dim_head]
+        q = split_heads(self.to_q(q_in), self.heads)
+        k = split_heads(self.to_k(k_in), self.heads)
+        v = split_heads(self.to_v(v_in), self.heads)
+        
+        # Truncate to original seq_len in case conv changed length
+        q = q[:, :, :seq_len]
+        k = k[:, :, :seq_len]
+        v = v[:, :, :seq_len]
+        
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        
+        # Flatten batch*heads for processing
+        # Apply polynomial feature map
+        k_flat = k.reshape(batch * self.heads * seq_len, d)
+        q_flat = q.reshape(batch * self.heads * seq_len, d)
+        
+        phi_k = self.phi(k_flat).view(BH, seq_len, d)
+        phi_q = self.phi(q_flat).view(BH, seq_len, d)
+        v_bh = v.reshape(BH, seq_len, d)
+        
+        # Learned hyperparameters: [BH, T]
+        lr = self.to_lr(x).transpose(1, 2).reshape(BH, seq_len)
+        decay = self.to_decay(x).transpose(1, 2).reshape(BH, seq_len)
+        
+        if self.use_momentum:
+            momentum = self.to_momentum(x).transpose(1, 2).reshape(BH, seq_len)
+        
+        # -----------------------------------------------------------------
+        # Efficient Scalar Scan Implementation
+        # -----------------------------------------------------------------
+        # Step 1: Compute per-token outer products (all parallel)
+        # G_t = φ_t ⊗ φ_t^T: [BH, T, d, d]
+        G = torch.einsum('bti,btj->btij', phi_k, phi_k)
+        # B_t = v_t ⊗ φ_t^T: [BH, T, d, d]
+        B = torch.einsum('bti,btj->btij', v_bh, phi_k)
+        
+        # Get initial states (for recurrence)
+        S0 = state.S  # [BH, d, d]
+        Z0 = state.Z if exists(state.Z) else torch.zeros_like(S0)
+        
+        # Step 2: Compute gradients using FIXED reference state S_ref (one batch matmul!)
+        # g_t = S_ref @ G_t - B_t
+        g = torch.einsum('bde,btef->btdf', S_ref, G) - B  # [BH, T, d, d]
+        
+        # Expand scalars for broadcasting: [BH, T, 1, 1]
+        lr_e = lr[..., None, None]
+        
+        if self.use_momentum:
+            # Step 3: Momentum via scalar scan: Z_t = β_t * Z_{t-1} + g_t
+            Z_all = self.assoc_scan(momentum, g, prev=Z0)  # [BH, T, d, d]
+            
+            # Step 4: Compute delta: δ_t = -η_t * Z_t
+            delta = -lr_e * Z_all  # [BH, T, d, d]
+            
+            # Step 5: State update via scalar scan: S_t = α_t * S_{t-1} + δ_t
+            S_all = self.assoc_scan(decay, delta, prev=S0)  # [BH, T, d, d]
+            
+            # Final states
+            S_end = S_all[:, -1].clamp(-100, 100)
+            Z_end = Z_all[:, -1]
+        else:
+            # No momentum: δ_t = -η_t * g_t
+            delta = -lr_e * g  # [BH, T, d, d]
+            
+            # State update via scalar scan: S_t = α_t * S_{t-1} + δ_t
+            S_all = self.assoc_scan(decay, delta, prev=S0)  # [BH, T, d, d]
+            
+            S_end = S_all[:, -1].clamp(-100, 100)
+            Z_end = None
+        
+        # -----------------------------------------------------------------
+        # Retrieval: y_t = S_{t-1} @ ψ_t
+        # -----------------------------------------------------------------
+        y0 = torch.einsum('bde,be->bd', S0, phi_q[:, 0])  # [BH, d]
+        if seq_len > 1:
+            y_rest = torch.einsum('btdp,btp->btd', S_all[:, :-1], phi_q[:, 1:])  # [BH, T-1, d]
+            retrieved = torch.cat([y0.unsqueeze(1), y_rest], dim=1)  # [BH, T, d]
+        else:
+            retrieved = y0.unsqueeze(1)  # [BH, 1, d]
+        
+        # Reshape to [batch, heads, seq, dim_head] and merge
+        retrieved = retrieved.view(batch, self.heads, seq_len, d)
+        retrieved = merge_heads(retrieved)
+        retrieved = self.to_out(retrieved)
+        
+        next_state = RNNMemState(
+            seq_index=state.seq_index + seq_len,
+            S=S_end,
+            Z=Z_end,
+            omega_buffer=None
+        )
+        
+        return retrieved, next_state
         d = self.dim_head
         BH = batch * self.heads
         
@@ -382,11 +535,15 @@ class RNNMemoryCell(Module):
         # -----------------------------------------------------------------
         # Retrieval: y_t = S_{t-1} @ ψ_t
         # -----------------------------------------------------------------
-        # S_start = [S_0, S_1, ..., S_{T-1}] (shifted by 1)
-        S_start = torch.cat([S0.unsqueeze(1), S_all[:, :-1]], dim=1)  # [BH, T, d, d]
-        
-        # S_start: [BH, T, d, d], phi_q: [BH, T, d]
-        retrieved = torch.einsum('btdp,btp->btd', S_start, phi_q)  # [BH, T, d]
+        # Memory optimization:
+        # Avoid materializing S_start=[S0, S_all[:, :-1]] which is [BH, T, d, d] and can be huge.
+        # Compute y_0 from S0, and y_{t>=1} from S_{t-1}=S_all[:, t-1] directly.
+        y0 = torch.einsum('bde,be->bd', S0, phi_q[:, 0])  # [BH, d]
+        if seq_len > 1:
+            y_rest = torch.einsum('btdp,btp->btd', S_all[:, :-1], phi_q[:, 1:])  # [BH, T-1, d]
+            retrieved = torch.cat([y0.unsqueeze(1), y_rest], dim=1)  # [BH, T, d]
+        else:
+            retrieved = y0.unsqueeze(1)  # [BH, 1, d]
         
         # Reshape to [batch, heads, seq, dim_head] and merge
         retrieved = retrieved.view(batch, self.heads, seq_len, d)
@@ -442,6 +599,7 @@ class OmegaRNNMemoryCell(Module):
         max_position_embeddings: int = 2048,  # ROPE max positions
         use_groupnorm: bool = False,  # GroupNorm option
         use_accelerated_scan: bool = False,
+        scan_chunk_len: int | None = None,
     ):
         super().__init__()
         self.dim = dim
@@ -451,6 +609,7 @@ class OmegaRNNMemoryCell(Module):
         self.use_omega_gate = use_omega_gate
         self.use_momentum = use_momentum
         self.qkv_conv_kernel = qkv_conv_kernel
+        self.scan_chunk_len = scan_chunk_len
         
         # GQA setup
         self.num_key_value_heads = default(num_key_value_heads, heads)
@@ -482,7 +641,17 @@ class OmegaRNNMemoryCell(Module):
         else:
             self.groupnorm = None
         
-        # Associative scan for parallel computation (use_accelerated=True requires Triton)
+        # Associative scan for parallel computation (use_accelerated=True prefers Triton).
+        # IMPORTANT: assoc-scan imports `accelerated_scan.triton` lazily inside forward(),
+        # so we proactively validate availability here to avoid runtime crashes.
+        if use_accelerated_scan:
+            try:
+                import accelerated_scan.triton  # noqa: F401
+            except Exception as e:
+                warnings.warn(
+                    f"accelerated_scan.triton unavailable; disabling accelerated scan. Error: {e}"
+                )
+                use_accelerated_scan = False
         self.assoc_scan = AssocScan(use_accelerated=use_accelerated_scan)
         
         dim_inner = dim_head * heads
@@ -563,11 +732,37 @@ class OmegaRNNMemoryCell(Module):
     ) -> tuple[Tensor, RNNMemState]:
         """Forward pass with Omega rule (sliding window)."""
         batch, seq_len, _ = x.shape
-        e = self.omega_window
-        
+
         if not exists(state):
             state = self.init_state(batch, x.device, x.dtype)
-        
+
+        chunk_len = self.scan_chunk_len
+        if exists(chunk_len) and seq_len > chunk_len:
+            if exists(self.q_conv) or exists(self.k_conv) or exists(self.v_conv):
+                raise NotImplementedError(
+                    "scan_chunk_len is not supported with qkv_conv_kernel > 1 (conv mixes across chunk boundaries)."
+                )
+            outs: list[Tensor] = []
+            cur_state = state
+            # Preserve current (unchunked) semantics for g: use a fixed reference state from the start of the call.
+            S_ref = cur_state.S
+            for start in range(0, seq_len, chunk_len):
+                end = min(seq_len, start + chunk_len)
+                out, cur_state = self._forward_impl(x[:, start:end], cur_state, S_ref=S_ref)
+                outs.append(out)
+            return torch.cat(outs, dim=1), cur_state
+
+        return self._forward_impl(x, state, S_ref=state.S)
+
+    def _forward_impl(
+        self,
+        x: Tensor,
+        state: RNNMemState,
+        *,
+        S_ref: Tensor,
+    ) -> tuple[Tensor, RNNMemState]:
+        batch, seq_len, _ = x.shape
+        e = self.omega_window
         d = self.dim_head
         BH = batch * self.heads
         
@@ -677,13 +872,13 @@ class OmegaRNNMemoryCell(Module):
         # -----------------------------------------------------------------
         # Efficient Scalar Scan Implementation (same as Titans-RNN)
         # -----------------------------------------------------------------
-        # Get initial states
+        # Get initial states (for recurrence)
         S0 = state.S  # [BH, d, d]
         Z0 = state.Z if exists(state.Z) else torch.zeros_like(S0)
         
-        # Compute gradients using FIXED S_0 (one batch matmul!)
-        # g_t = S_0 @ G_t - B_t
-        g = torch.einsum('bde,btef->btdf', S0, G) - B  # [BH, T, d, d]
+        # Compute gradients using FIXED reference state S_ref (one batch matmul!)
+        # g_t = S_ref @ G_t - B_t
+        g = torch.einsum('bde,btef->btdf', S_ref, G) - B  # [BH, T, d, d]
         
         # Expand scalars for broadcasting: [BH, T, 1, 1]
         lr_e = lr[..., None, None]
@@ -711,13 +906,16 @@ class OmegaRNNMemoryCell(Module):
             S_end = S_all[:, -1].clamp(-100, 100)
             Z_end = None
         
-        # S_start = [S_0, S_1, ..., S_{T-1}] (shifted by 1)
-        S_start = torch.cat([S0.unsqueeze(1), S_all[:, :-1]], dim=1)  # [BH, T, d, d]
-        
         # -----------------------------------------------------------------
         # Retrieval: y_t = S_{t-1} @ ψ_t
         # -----------------------------------------------------------------
-        retrieved = torch.einsum('btdp,btp->btd', S_start, phi_q)
+        # Memory optimization: avoid materializing S_start ([BH, T, d, d]).
+        y0 = torch.einsum('bde,be->bd', S0, phi_q[:, 0])  # [BH, d]
+        if seq_len > 1:
+            y_rest = torch.einsum('btdp,btp->btd', S_all[:, :-1], phi_q[:, 1:])  # [BH, T-1, d]
+            retrieved = torch.cat([y0.unsqueeze(1), y_rest], dim=1)  # [BH, T, d]
+        else:
+            retrieved = y0.unsqueeze(1)  # [BH, 1, d]
         
         retrieved = retrieved.view(batch, self.heads, seq_len, d)
         retrieved = merge_heads(retrieved)
@@ -773,6 +971,8 @@ class RNNMemory(Module):
         rope_theta: float = 10000.0,
         max_position_embeddings: int = 2048,
         use_groupnorm: bool = False,  # GroupNorm option
+        use_accelerated_scan: bool = False,
+        scan_chunk_len: int | None = None,
     ):
         super().__init__()
         
@@ -796,6 +996,8 @@ class RNNMemory(Module):
             rope_theta=rope_theta,
             max_position_embeddings=max_position_embeddings,
             use_groupnorm=use_groupnorm,  # GroupNorm
+            use_accelerated_scan=use_accelerated_scan,
+            scan_chunk_len=scan_chunk_len,
         )
     
     @property

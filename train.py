@@ -38,7 +38,10 @@ if __name__ == "__main__":
     config, errors = parse_cmdline_configs(sys.argv[1:])
     if errors != '':
         print(errors)
-        exit()
+        # IMPORTANT: treat config/CLI parse errors as a hard failure.
+        # Otherwise shell scripts will interpret this as success and continue,
+        # causing silent "no-op" runs (e.g., early-stop repro never actually trains).
+        raise SystemExit(1)
     
 
     np.set_printoptions(precision=4, suppress=True, linewidth=200)
@@ -52,11 +55,19 @@ if __name__ == "__main__":
     os.environ["RWKV_MODEL_TYPE"] = config.model.tmix
     os.environ["RWKV_CTXLEN"] = str(config.model.ctx_len)
     os.environ["RWKV_HEAD_SIZE_A"] = str(config.model.head_size)
-    # Only set RWKV_ATTENTION_TYPE for RWKV models, not Atlas models
-    if hasattr(config.model, 'attention_type') and config.model.attention_type:
-        os.environ["RWKV_ATTENTION_TYPE"] = config.model.attention_type
-    else:
-        os.environ["RWKV_ATTENTION_TYPE"] = ""  # Dummy value for Atlas models
+    # RWKV_ATTENTION_TYPE is consumed at import-time by some model implementations (e.g. models/qwen2.py).
+    # Keep it non-empty to avoid import-time asserts when we instantiate a teacher with classname=qwen2
+    # while the student is an Atlas model (which might not set attention_type).
+    attn_type = ""
+    if hasattr(config.model, "attention_type"):
+        attn_type = str(config.model.attention_type or "")
+    if not attn_type:
+        # Allow env override (e.g. set by scripts) before falling back.
+        attn_type = str(os.environ.get("RWKV_ATTENTION_TYPE", "") or "")
+    if not attn_type:
+        # Safe default used in this repo (Triton implementation present in-tree).
+        attn_type = "rwkv7_wind_triton_bighead"
+    os.environ["RWKV_ATTENTION_TYPE"] = attn_type
 
     model_name = f'{config.model.tmix}'
     if config.model.tmix2 != '':
@@ -269,9 +280,9 @@ if __name__ == "__main__":
     teacher_config = None
     if config.train.train_stage > 1:
         teacher_config = config.train.teacher
-        # NOTE: Teacher presence is controlled by `train.teacher` itself, not by `train.teacher.path`.
-        # `path` is only for optionally loading teacher weights from a local checkpoint.
-        if teacher_config is not None:
+        # Paper behavior: teacher existence is gated by teacher.path.
+        # This avoids unintentionally enabling a teacher and keeps FSDP init assumptions consistent.
+        if teacher_config is not None and getattr(teacher_config, "path", "") != '':
             print("Instantiating teacher model")
             hf_path = teacher_config.model.hf_path
             classname = teacher_config.model.classname
@@ -392,8 +403,62 @@ if __name__ == "__main__":
         validation_data_loader = DataLoader(validation_data, shuffle=False, pin_memory=True, batch_size=config.train.micro_bsz, num_workers=1, persistent_workers=False, drop_last=True)
 
     ds_ckpt_path = None
-    #if 'deepspeed_stage_3' in config.train.strategy and config.continued:
-    #    ds_ckpt_path = config.train.load_model
+    # Full (proper) resume: restore optimizer, schedulers, and step counters.
+    # If provided, prefer the explicit environment variable set by the stage scripts.
+    full_ckpt_env = os.environ.get("FULL_RESUME_CKPT_PATH", "").strip()
+    if full_ckpt_env:
+        ds_ckpt_path = full_ckpt_env
+        # Ensure our LightningModule skips manual weight-loading/reset paths.
+        os.environ["FULL_RESUME"] = "1"
+        rank_zero_info(f"[resume] Using FULL_RESUME_CKPT_PATH={ds_ckpt_path}")
+    
+    # PyTorch Profiler (optional, controlled via ENABLE_PROFILER env)
+    # Usage: export ENABLE_PROFILER=1 to profile first few steps and upload trace to GCS
+    enable_profiler = os.environ.get("ENABLE_PROFILER", "").strip() == "1"
+    profiler_ctx = nullcontext()
+    profiler_output_path = None
+    
+    if enable_profiler and torch.cuda.is_available():
+        profiler_output_path = os.path.join(config.runtime.proj_path, "profiler_trace")
+        os.makedirs(profiler_output_path, exist_ok=True)
+        rank_zero_info(f"[profiler] Profiling enabled. Output: {profiler_output_path}")
+        rank_zero_info("[profiler] Will profile steps: 2 warmup + 3 active + 1 cooldown (total ~6 steps)")
+        
+        from torch.profiler import profile, ProfilerActivity, schedule
+        profiler_ctx = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=schedule(wait=0, warmup=0, active=3, repeat=1),  # warmup=0 to capture first step
+            on_trace_ready=lambda prof: prof.export_chrome_trace(
+                os.path.join(profiler_output_path, f"trace_rank{torch.distributed.get_rank() if torch.distributed.is_initialized() else 0}.json")
+            ),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
+    
     print("Trainer.fit")
-    trainer.fit(wrapper, train_dataloaders=train_data_loader, val_dataloaders=validation_data_loader, ckpt_path=ds_ckpt_path)
+    with profiler_ctx:
+        trainer.fit(wrapper, train_dataloaders=train_data_loader, val_dataloaders=validation_data_loader, ckpt_path=ds_ckpt_path)
+    
+    # Upload profiler trace to GCS (rank0 only)
+    if enable_profiler and profiler_output_path and trainer.is_global_zero:
+        try:
+            gcs_bucket = os.environ.get("GCS_BUCKET", "").strip()
+            gcs_prefix = os.environ.get("GCS_PREFIX", "").strip().strip("/")
+            exp_id = os.environ.get("EXP_ID", "").strip()
+            run_id = os.environ.get("RUN_ID", "").strip()
+            
+            if gcs_bucket.startswith("gs://") and gcs_prefix and exp_id and run_id:
+                gcs_dest = f"{gcs_bucket.rstrip('/')}/{gcs_prefix}/{exp_id}/{run_id}/profiler_trace/"
+                rank_zero_info(f"[profiler] Uploading trace to GCS: {gcs_dest}")
+                import subprocess
+                subprocess.run(
+                    ["gsutil", "-m", "cp", "-r", f"{profiler_output_path}/*", gcs_dest],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                rank_zero_info(f"[profiler] Upload complete. View at: chrome://tracing (load the JSON file)")
+        except Exception as e:
+            rank_zero_info(f"[profiler] Upload failed: {e}")
 

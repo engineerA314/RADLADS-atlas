@@ -1,0 +1,20 @@
+train:
+  teacher:
+    # Paper-style teacher checkpoint path (single-file safetensors or .pth).
+    # This file is expected to be prepared before Stage 2 starts.
+    path: out/qwen2-0B5.pth
+    model:
+      __type__: configs.Transformer_Config
+      # Use the paper Qwen2 implementation (has configure_model) so FSDP init is consistent.
+      classname: qwen2
+      #tmix: qwen2
+      ctx_len: 512
+      vocab_size: 151936
+      vocab_padding_idx: 151646
+      num_key_value_heads: 2
+      n_embd: 896
+      dim_ffn: 4864
+      n_layer: 24
+      rope:
+        __type__: configs.RoPE_Config
+        base: 1000000.0

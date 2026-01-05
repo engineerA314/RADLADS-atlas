@@ -56,6 +56,7 @@ class AtlasLLMOutput:
 def config_to_atlas_config(config) -> AtlasConfig:
     """Convert RADLADS TrainerCLI_Config.model to AtlasConfig."""
     model_cfg = config.model if hasattr(config, 'model') else config
+    train_cfg = getattr(config, 'train', None)
     
     # Extract atlas-specific settings (with defaults)
     memory_heads = getattr(model_cfg, 'memory_heads', None)
@@ -91,11 +92,14 @@ def config_to_atlas_config(config) -> AtlasConfig:
         rope_theta=getattr(model_cfg, 'rope_theta', 10000.0),
         max_position_embeddings=getattr(model_cfg, 'max_position_embeddings', 2048),
         use_groupnorm=getattr(model_cfg, 'use_groupnorm', False),
+        use_accelerated_scan=getattr(model_cfg, 'use_accelerated_scan', True),
+        memory_scan_chunk_len=getattr(model_cfg, 'memory_scan_chunk_len', None),
         atlas_variant=getattr(model_cfg, 'atlas_variant', 'lmm'),
         sliding_window=getattr(model_cfg, 'sliding_window', 512),
         ctx_len=model_cfg.ctx_len,
         vocab_padding_idx=getattr(model_cfg, 'vocab_padding_idx', None),
         tie_word_embeddings=getattr(model_cfg, 'tie_word_embeddings', True),
+        grad_cp=getattr(train_cfg, 'grad_cp', 0) if train_cfg is not None else 0,
     )
 
 

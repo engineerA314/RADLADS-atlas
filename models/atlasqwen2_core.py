@@ -26,6 +26,7 @@ from typing import Optional, Tuple, List, NamedTuple
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 from torch import Tensor
 
 from models.atlas_memory import RNNMemory, RNNMemState, state_detach
@@ -118,6 +119,15 @@ class AtlasConfig:
     
     # GroupNorm configuration
     use_groupnorm: bool = False  # Enable per-head GroupNorm
+
+    # AssocScan backend
+    # If True, uses the accelerated (Triton) scan path in `assoc_scan` when available.
+    use_accelerated_scan: bool = True
+
+    # Chunked scan (memory)
+    # If set, compute scan in chunks of this length to reduce peak memory.
+    # This does NOT require a custom CUDA kernel, but may be slower due to Python-level looping.
+    memory_scan_chunk_len: Optional[int] = None
     
     # Architecture variant: 'lmm' (memory only) or 'mal' (memory + attention)
     atlas_variant: str = 'lmm'
@@ -129,6 +139,10 @@ class AtlasConfig:
     ctx_len: int = 2048
     vocab_padding_idx: Optional[int] = None
     tie_word_embeddings: bool = True
+
+    # Training-time knobs (kept here so the core can apply them without depending on TrainerCLI_Config)
+    # grad_cp=1 enables activation checkpointing for Atlas blocks (reduces activation memory, recomputes in backward).
+    grad_cp: int = 0
     
     def to_dict(self):
         """Convert to dictionary for serialization."""
@@ -152,9 +166,12 @@ class AtlasConfig:
             'rope_theta': self.rope_theta,
             'max_position_embeddings': self.max_position_embeddings,
             'use_groupnorm': self.use_groupnorm,
+            'use_accelerated_scan': self.use_accelerated_scan,
+            'memory_scan_chunk_len': self.memory_scan_chunk_len,
             'ctx_len': self.ctx_len,
             'vocab_padding_idx': self.vocab_padding_idx,
             'tie_word_embeddings': self.tie_word_embeddings,
+            'grad_cp': self.grad_cp,
         }
     
     @classmethod
@@ -306,6 +323,8 @@ class AtlasLMMBlock(nn.Module):
             rope_theta=config.rope_theta,
             max_position_embeddings=config.max_position_embeddings,
             use_groupnorm=config.use_groupnorm,
+            use_accelerated_scan=getattr(config, "use_accelerated_scan", True),
+            scan_chunk_len=getattr(config, "memory_scan_chunk_len", None),
         )
         
         # MLP
@@ -388,6 +407,8 @@ class AtlasMALBlock(nn.Module):
             rope_theta=config.rope_theta,
             max_position_embeddings=config.max_position_embeddings,
             use_groupnorm=config.use_groupnorm,
+            use_accelerated_scan=getattr(config, "use_accelerated_scan", True),
+            scan_chunk_len=getattr(config, "memory_scan_chunk_len", None),
         )
         
         # Sliding window attention
@@ -532,7 +553,54 @@ class AtlasQwen2Core(nn.Module):
         
         for layer_idx, layer in enumerate(self.layers):
             layer_state = model_state.layer_states[layer_idx]
-            hidden_states, new_layer_state = layer(hidden_states, layer_state)
+            # Activation checkpointing (memory saver).
+            #
+            # IMPORTANT: torch.utils.checkpoint requires all *inputs* to be Tensors, and outputs should be
+            # Tensors (or nested structures of Tensors). Our layer_state is a NamedTuple, so we checkpoint
+            # a small wrapper that takes only state tensors and reconstructs the state inside.
+            if self.training and getattr(self.config, "grad_cp", 0) == 1:
+                mem0 = layer_state.memory_state
+                seq_index0 = mem0.seq_index
+                use_momentum = bool(self.config.use_momentum)
+                omega_enabled = int(self.config.omega_window) > 1
+
+                S0 = mem0.S
+                Z0 = mem0.Z if mem0.Z is not None else S0.new_zeros(S0.shape)
+                omega0 = mem0.omega_buffer if mem0.omega_buffer is not None else S0.new_empty((0,))
+
+                def _ckpt_layer(h: Tensor, S: Tensor, Z: Tensor, omega_buf: Tensor):
+                    mem_state = RNNMemState(
+                        seq_index=seq_index0,
+                        S=S,
+                        Z=(Z if use_momentum else None),
+                        omega_buffer=(omega_buf if omega_enabled and omega_buf.numel() != 0 else None),
+                    )
+                    out_h, out_layer_state = layer(h, AtlasLayerState(memory_state=mem_state))
+                    out_mem = out_layer_state.memory_state
+                    out_S = out_mem.S
+                    out_Z = out_mem.Z if out_mem.Z is not None else Z.new_zeros(out_S.shape)
+                    out_omega = out_mem.omega_buffer if out_mem.omega_buffer is not None else omega_buf.new_empty((0,))
+                    return out_h, out_S, out_Z, out_omega
+
+                out_h, out_S, out_Z, out_omega = torch.utils.checkpoint.checkpoint(
+                    _ckpt_layer,
+                    hidden_states,
+                    S0,
+                    Z0,
+                    omega0,
+                    use_reentrant=False,
+                )
+
+                hidden_states = out_h
+                new_mem_state = RNNMemState(
+                    seq_index=seq_index0 + seq_len,
+                    S=out_S,
+                    Z=(out_Z if use_momentum else None),
+                    omega_buffer=(out_omega if omega_enabled and out_omega.numel() != 0 else None),
+                )
+                new_layer_state = AtlasLayerState(memory_state=new_mem_state)
+            else:
+                hidden_states, new_layer_state = layer(hidden_states, layer_state)
             new_layer_states.append(new_layer_state)
             
             if output_hidden_states:

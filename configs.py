@@ -88,6 +88,11 @@ class Atlas_Config(Transformer_Config):
     poly_mode:str = 'off'
     qk_norm:bool = True
     qkv_conv_kernel:int | None = None
+    # AssocScan backend + memory scan chunking (for OOM prevention / reproducibility)
+    # - use_accelerated_scan: prefer Triton accelerated scan (code falls back if unavailable)
+    # - memory_scan_chunk_len: if set, chunk scan to reduce peak memory; None disables chunking
+    use_accelerated_scan:bool = True
+    memory_scan_chunk_len:int | None = None
     # Normalization options (for ablation study)
     use_groupnorm:bool = False  # Use GroupNorm in attention
     use_rope:bool = False  # Use Rotary Position Embedding
@@ -181,6 +186,25 @@ class Train_Config:
     data_file:str = ''
     validation_data_file:str = ''
     data_type:str = 'utf-8'
+
+    # Early stopping (step-based). Off by default; enable via CLI:
+    #   --train.early_stop true
+    # Optional tuning:
+    #   --train.early_stop_min_steps 500
+    #   --train.early_stop_patience_steps 1000
+    #   --train.early_stop_min_delta 1e-4
+    #   --train.early_stop_ema_alpha 0.05
+    #   --train.early_stop_loss_clip 10.0
+    #   --train.early_stop_target_loss 0.1
+    #   --train.early_stop_target_patience_steps 200
+    early_stop: bool = False
+    early_stop_min_steps: int = 0
+    early_stop_patience_steps: int = 0  # 0 disables "plateau" stopping
+    early_stop_min_delta: float = 0.0
+    early_stop_ema_alpha: float = 0.05
+    early_stop_loss_clip: float | None = 10.0
+    early_stop_target_loss: float | None = None
+    early_stop_target_patience_steps: int = 0  # 0 disables "target reached" stopping
 
 @dataclass(kw_only=True)
 class TrainerCLI_Config:

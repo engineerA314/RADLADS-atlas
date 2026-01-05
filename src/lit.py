@@ -39,6 +39,24 @@ from src.logger import print0 as print
 def console_clear_last_line():
     print('\033[1A', end='\x1b[2K')
 
+def print_gpu_memory(tag: str, rank: int = None):
+    """Print GPU memory usage at a specific point. Rank0 only by default."""
+    if rank is None and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    elif rank is None:
+        rank = 0
+    
+    if rank != 0:
+        return  # Only rank 0 prints
+    
+    if not torch.cuda.is_available():
+        return
+    
+    allocated = torch.cuda.memory_allocated() / 1e9
+    reserved = torch.cuda.memory_reserved() / 1e9
+    max_allocated = torch.cuda.max_memory_allocated() / 1e9
+    print(f"[GPU MEM {tag}] Alloc: {allocated:.2f}GB | Reserved: {reserved:.2f}GB | Peak: {max_allocated:.2f}GB")
+
 class L2Wrap(torch.autograd.Function):
     @staticmethod
     def forward(ctx, loss, y):
@@ -85,7 +103,10 @@ class LightningModelWrapper(pl.LightningModule):
         # FIXME - not sure how the resetted and/or loaded weights are getting transferred to the other GPUs on DS1, but it seems to be working??!
         if self.trainer.global_rank == 0:
             if 'deepspeed_stage_3' not in self.config.train.strategy:
-                self.load_weights()
+                # For full framework resume, Lightning will restore weights from ckpt_path.
+                # Don't also do our own weights-loading/reset path.
+                if str(os.environ.get("FULL_RESUME", "0")).strip() != "1":
+                    self.load_weights()
 
         # if self.config.train.strategy == 'fsdp':
         #     from functools import partial
@@ -114,49 +135,79 @@ class LightningModelWrapper(pl.LightningModule):
                 if self.config.train.load_model == '' or (self.config.train.load_partial and self.config.train.attention_distillation_stage in (0,1)):
                     do_reset = True
 
-        # we require that the module supports configure_model for this code to work well
-        # HuggingFace models don't have configure_model, so skip for them
-        is_hf_like = not hasattr(model, 'configure_model')
-        if hasattr(model, 'configure_model'):
-            # NOTE:
-            # - For most strategies we build on meta to save peak init memory, then materialize with to_empty().
-            # - For DeepSpeed ZeRO-3, parameter partitioning happens during module init, and DeepSpeed will try
-            #   to move newly-created Parameters to GPU shards. Meta tensors have no backing storage, so this
-            #   fails with: "Cannot copy out of meta tensor; no data!".
-            use_zero3 = self.config.train is not None and ('deepspeed_stage_3' in self.config.train.strategy)
-            if use_zero3:
+        # Full framework resume (trainer.fit(..., ckpt_path=...)) will restore weights/optimizer/step.
+        # Do NOT reset params in that case even if load_model is empty.
+        if str(os.environ.get("FULL_RESUME", "0")).strip() == "1":
+            do_reset = False
+
+        # Strategy helpers
+        strategy_name = str(getattr(self.config.train, "strategy", "") or "")
+        use_fsdp = "fsdp" in strategy_name
+        use_zero3 = "deepspeed_stage_3" in strategy_name
+
+        # HF models (e.g., transformers.Qwen2ForCausalLM) do NOT implement configure_model().
+        # They are supported in this repo for HF patching paths (Stage 1) under DS1/DS2, but
+        # are NOT supported under FSDP or ZeRO-3 init in our training stack.
+        if not hasattr(model, "configure_model"):
+            if use_fsdp or use_zero3:
+                raise RuntimeError(
+                    f"Model {type(model)} does not implement configure_model(), which is required for "
+                    f"FSDP/ZeRO-3 init (strategy={strategy_name}). "
+                    f"Use a paper-style model implementation with configure_model() for this strategy."
+                )
+            # DS1/DS2 (and other non-FSDP, non-ZeRO3) path: just move to device+dtype and return.
+            dtype_map = {"bf16-true":torch.bfloat16, "bf16-mixed":torch.bfloat16, "16-true":torch.float16, "16-mixed":torch.float16, "32-true":torch.float32}
+            dtype = dtype_map[self.trainer.precision]
+            print("Moving model to dtype ", dtype)
+            model.to(device=self.device, dtype=dtype)
+            return
+
+        # Paper behavior for models implementing configure_model():
+        # - Most strategies: init on meta, then materialize via to_empty().
+        # - ZeRO-3: cannot init on meta.
+        if use_zero3:
+            model.configure_model()
+        else:
+            with init_on_meta_device():
                 model.configure_model()
-            else:
-                #with self.trainer.init_module(empty_init=True): # FIXME - we can probably use this instead of meta then convert to dtype then to_empty
-                with init_on_meta_device():
-                    model.configure_model()
 
         dtype_map = {"bf16-true":torch.bfloat16, "bf16-mixed":torch.bfloat16, "16-true":torch.float16, "16-mixed":torch.float16, "32-true":torch.float32}
         dtype = dtype_map[self.trainer.precision]
 
         print("Moving model to dtype ", dtype)
-        # IMPORTANT:
-        # - For our own models (supporting configure_model), we build on meta and then materialize with to_empty().
-        # - For HuggingFace-style models (no configure_model), parameters are already materialized (e.g., from_pretrained()).
-        #   Calling to_empty() would wipe pretrained weights, leaving uninitialized garbage which can produce NaNs immediately.
-        if is_hf_like:
-            model.to(device=self.device, dtype=dtype)
-            return
         model.to(dtype=dtype)
+
         # DeepSpeed ZeRO-3: do NOT to_empty() (and do not rely on meta init above).
         # DeepSpeed needs real storage during partitioning; parameters are already materialized.
-        if self.config.train is not None and ('deepspeed_stage_3' in self.config.train.strategy):
+        if use_zero3:
             return
         if 'fsdp' in self.config.train.strategy:
-            if self.trainer.global_rank == 0:
+            # NOTE:
+            # The paper-style flow keeps non-rank0 on meta and relies on FSDP sync_module_states to materialize.
+            # For Atlas models in this repo, we've observed runtime failures that look like meta/empty storage
+            # escaping into backward ("setStorage ... storage of size 0"). To make FSDP robust for our tests,
+            # we optionally materialize on ALL ranks (still on CPU by default, so sharding can proceed).
+            eager_fsdp_init = str(os.environ.get("FSDP_EAGER_INIT", "")).strip().lower() in ("1", "true")
+            if getattr(self.config.model, "classname", "") == "atlasqwen2":
+                eager_fsdp_init = True
+
+            if eager_fsdp_init:
                 if do_reset:
-                    # NOTE - we could put it on cpu here for truly huge models, but it's a LOT faster to reset parameters on GPU
-                    print("Moving model to empty on", self.device)
+                    print("FSDP eager init: moving model to empty on", self.device)
                     model.to_empty(device=self.device, recurse=True)
                 else:
-                    print("Moving model to empty on cpu")
+                    print("FSDP eager init: moving model to empty on cpu (all ranks)")
                     model.to_empty(device=torch.device('cpu'), recurse=True)
-            # else leave it as a meta tensor on non-zero ranks... FSDP will convert
+            else:
+                if self.trainer.global_rank == 0:
+                    if do_reset:
+                        # NOTE - we could put it on cpu here for truly huge models, but it's a LOT faster to reset parameters on GPU
+                        print("Moving model to empty on", self.device)
+                        model.to_empty(device=self.device, recurse=True)
+                    else:
+                        print("Moving model to empty on cpu")
+                        model.to_empty(device=torch.device('cpu'), recurse=True)
+                # else leave it as a meta tensor on non-zero ranks... FSDP will convert
         else:
             print("Moving model to empty on", self.device)
             model.to_empty(device=self.device, recurse=True)
@@ -172,6 +223,7 @@ class LightningModelWrapper(pl.LightningModule):
                             if hasattr(submodule, 'reset_parameters'):
                                 submodule.reset_parameters()
 
+            # Move to CPU for FSDP/DeepSpeed sharding.
             if 'deepspeed_stage_3' in self.config.train.strategy or 'fsdp' in self.config.train.strategy:
                 print("Moving model back to CPU, so giant models have room to get sharded")
                 model.to(device=torch.device('cpu'))
@@ -238,13 +290,9 @@ class LightningModelWrapper(pl.LightningModule):
                 if save_dict is None:
                     save_dict = {}
                 #print("saving prefix", prefix)
-                if deepspeed is None:
-                    raise ImportError("DeepSpeed is required for strategy=deepspeed_stage_3 but could not be imported.")
                 with deepspeed.zero.GatheredParameters(list(module.parameters(recurse=False)), modifier_rank=0):
                     if deepspeed.comm.get_rank() == 0:
-                        # Important: only save this module's direct params here.
-                        # Child module params are handled by recursion below.
-                        for n, p in module.named_parameters(recurse=False):
+                        for n, p in module.named_parameters():
                             save_dict[prefix + n] = p.detach().cpu()
 
                 for name, child in module._modules.items():
@@ -328,7 +376,13 @@ class LightningModelWrapper(pl.LightningModule):
         if self.teacher is not None and config.train.teacher is not None:
            teacher_ckpt_path = config.train.teacher.path
            if teacher_ckpt_path != '':
-               self.load_specific_model_weights(self.teacher, teacher_ckpt_path)
+               # Paper expects teacher.path to exist (local checkpoint).
+               # Atlas configs may use teacher.path as an enable-flag (or point to a file produced elsewhere).
+               # Be robust: only load if it exists; otherwise keep initialized weights.
+               if os.path.exists(teacher_ckpt_path):
+                   self.load_specific_model_weights(self.teacher, teacher_ckpt_path)
+               else:
+                   print(f"[teacher] WARNING: teacher.path='{teacher_ckpt_path}' not found; skipping teacher weight load.")
 
     def load_specific_model_weights(self, model, ckpt_path):
         config = self.config
@@ -352,10 +406,32 @@ class LightningModelWrapper(pl.LightningModule):
                 
             # FIXME - this gives the inline teacher the copies it needs of the self_attn weights
             if config.train.attention_distillation_stage == 1:
+                # Two possible checkpoint formats may be used for Stage 1:
+                # 1) HF-style (teacher weights live under `.self_attn.*`) -> we need to duplicate to `.teacher_attn.*`
+                # 2) "Stage2-format" produced by save_weights() remapping (`.memory.*`, `post_memory_layernorm`, etc).
+                #    For Stage 1 resume we support loading this by mapping keys back into the wrapper's student path:
+                #      model.layers.X.memory.* -> model.layers.X.self_attn.student_attn.memory.*
+                #      post_memory_layernorm   -> post_attention_layernorm
                 keys = list(load_dict.keys())
-                for k in keys:
-                    if '.self_attn.' in k:
-                        load_dict[k.replace('self_attn', 'teacher_attn')] = load_dict[k]                            
+                is_stage2_format = any('.memory.' in k for k in keys) and not any('.student_attn.' in k for k in keys)
+                if is_stage2_format:
+                    new_load_dict = {}
+                    for k, v in load_dict.items():
+                        k_new = k
+                        # Memory remap (stage2 -> stage1 wrapper)
+                        if '.memory.' in k_new:
+                            k_new = k_new.replace('.memory.', '.self_attn.student_attn.memory.')
+                        # LayerNorm name remap (stage2 -> stage1 HF layer)
+                        if 'post_memory_layernorm' in k_new:
+                            k_new = k_new.replace('post_memory_layernorm', 'post_attention_layernorm')
+                        new_load_dict[k_new] = v
+                    load_dict = new_load_dict
+                else:
+                    # HF-style teacher duplication (avoid copying student paths)
+                    keys = list(load_dict.keys())
+                    for k in keys:
+                        if '.self_attn.' in k and '.self_attn.student_attn.' not in k:
+                            load_dict[k.replace('self_attn', 'teacher_attn')] = load_dict[k]
 
         strict = not config.train.load_partial #and config.train.attention_distillation_stage != 2
 
@@ -532,7 +608,20 @@ class LightningModelWrapper(pl.LightningModule):
 
 
     def _get_loss_logits_preds(self, batch, batch_idx, last_model_state):
+        # Distillation KL chunking:
+        # - Larger = faster, smaller = lower peak memory.
+        # - FSDP tends to have slightly higher peaks (all-gathers + allocator fragmentation),
+        #   so we default to smaller chunks under FSDP to avoid OOM.
+        try:
+            distill_chunk_len = int(os.environ.get("DISTILL_KL_CHUNK_LEN", "0") or 0)
+        except Exception:
+            distill_chunk_len = 0
+        if distill_chunk_len <= 0:
+            distill_chunk_len = 256 if "fsdp" in str(self.config.train.strategy).lower() else 512
+
         x, y = batch
+        
+        print_gpu_memory("step_start")
 
         B, T = x.shape
         causal_mask = torch.full((T, T), fill_value=-torch.inf, dtype=torch.bfloat16, device=x.device).triu(1)
@@ -556,7 +645,10 @@ class LightningModelWrapper(pl.LightningModule):
             if self.config.model.hf_path != '':
                 # For HuggingFace models with AttentionDistillationWrapper patched layers,
                 # the alignment loss is computed inside each wrapper and stored in _last_alignment_loss
-                results = self.model.forward(x, output_hidden_states=False, output_attentions=True)
+                # Avoid requesting attention weights when not needed. Some HF attention implementations
+                # (e.g., sdpa/flash) warn that output_attentions=True is unsupported.
+                # Stage 1 alignment uses wrapper-stored _last_alignment_loss and does not require weights.
+                results = self.model.forward(x, output_hidden_states=False, output_attentions=output_attentions)
                 
                 # Collect alignment losses from wrapper layers
                 if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
@@ -601,10 +693,14 @@ class LightningModelWrapper(pl.LightningModule):
         else:
             
             if self.training and self.config.train.attention_distillation_stage == 23:
+                print_gpu_memory("before_student_forward")
                 results = self.model.forward(x, output_hidden_states=True, output_attentions=False, output_post_attention_hidden_states=False)
+                print_gpu_memory("after_student_forward")
+                
                 self.teacher.eval()
                 with torch.no_grad():
                     teacher_results = self.teacher.forward(x, output_hidden_states=True)
+                print_gpu_memory("after_teacher_forward")
                 #reported_loss = training_loss = torch.linalg.vector_norm(torch.cat(teacher_results.hidden_states[1:], dim=0) - torch.cat(results.hidden_states[1:], dim=0), dim=-1).mean() * (results.hidden_states[0].size(-1) ** -0.5)
 
                 student_logits = results.logits
@@ -615,7 +711,7 @@ class LightningModelWrapper(pl.LightningModule):
                 teacher_logits = teacher_results.logits
                 flat_teacher_logits = teacher_logits.view(-1, teacher_logits.size(-1))
 
-                chunk_len = 512
+                chunk_len = distill_chunk_len
                 n_chunks = (flat_student_logits.size(0) + chunk_len - 1) // chunk_len
 
                 # memory saving measure, because otherwise kl_div tried to allocate everything all at once
@@ -630,11 +726,13 @@ class LightningModelWrapper(pl.LightningModule):
                         reduction='batchmean'
                     )
                 distillation_loss = distillation_loss / n_chunks
+                print_gpu_memory("after_kl_loss")
 
                 #reported_loss = training_loss = distillation_loss + torch.linalg.vector_norm(teacher_results.hidden_states[-1] - results.hidden_states[-1], dim=-1).mean() * (results.hidden_states[0].size(-1) ** -0.5)
                 hidden_states_loss = torch.tensor(0.0, device=flat_student_logits.device, dtype=flat_student_logits.dtype)
                 for layer_id in range(1,len(results.hidden_states)-1):
                     hidden_states_loss = hidden_states_loss + torch.linalg.vector_norm(teacher_results.hidden_states[layer_id] - results.hidden_states[layer_id], dim=-1).mean() / (len(results.hidden_states)-2) * (results.hidden_states[0].size(-1) ** -0.5)
+                print_gpu_memory("after_hidden_loss")
                 reported_loss = training_loss = distillation_loss + hidden_states_loss
                 logits = torch.tensor([], device=x.device)
                 return reported_loss, training_loss, logits, preds, last_model_state
@@ -677,7 +775,7 @@ class LightningModelWrapper(pl.LightningModule):
             reported_loss = training_loss = distillation_loss = ce_loss = torch.tensor(0.0, device=flat_student_logits.device, dtype=flat_student_logits.dtype)
 
             chunk_loss_calcs = self.config.train.attention_distillation_stage in (-1, 2, 21, 31)
-            chunk_len = 512
+            chunk_len = distill_chunk_len
             n_chunks = (flat_student_logits.size(0) + chunk_len - 1) // chunk_len
             if not self.training or self.teacher is None or self.config.train.teacher.ce_weight > 0:
                 if not chunk_loss_calcs:
@@ -698,41 +796,78 @@ class LightningModelWrapper(pl.LightningModule):
 
             if self.training and self.teacher is not None:
                 self.teacher.eval()
+                # IMPORTANT:
+                # For FSDP, materializing full teacher logits [B*T, vocab] can easily OOM (~300MB+ just for logits).
+                # Instead, prefer computing teacher hidden states once, then apply teacher.lm_head + log_softmax in
+                # token chunks while accumulating KL, without ever storing full teacher logits.
+                teacher_hidden_flat = None
+                flat_teacher_logits = None  # fallback only
                 with torch.no_grad():
-                    teacher_results = self.teacher.forward(x)
-                    if isinstance(teacher_results, tuple):
-                        teacher_logits = teacher_results[0]
-                    elif isinstance(results, torch.Tensor):
-                        teacher_logits = teacher_results
-                    else:
-                        teacher_logits = teacher_results.logits
-                    flat_teacher_logits = teacher_logits.view(-1, teacher_logits.size(-1))
-                    
-                    # ALWAYS debug batch 0 to catch NaN issues early
-                    if batch_idx == 0:
-                        s_nonfinite = (~torch.isfinite(flat_student_logits)).sum().item()
-                        t_nonfinite = (~torch.isfinite(flat_teacher_logits)).sum().item()
-                        if s_nonfinite > 0 or t_nonfinite > 0:
-                            print(f"⚠️  NaN/Inf detected in batch 0 BEFORE KL calculation:")
-                            print(f"   Student logits: {s_nonfinite}/{flat_student_logits.numel()} non-finite")
-                            if s_nonfinite > 0:
-                                s_finite_mask = torch.isfinite(flat_student_logits)
-                                if s_finite_mask.any():
-                                    print(f"      Finite student range: [{flat_student_logits[s_finite_mask].min():.4f}, {flat_student_logits[s_finite_mask].max():.4f}]")
-                            print(f"   Teacher logits: {t_nonfinite}/{flat_teacher_logits.numel()} non-finite")
-                            if t_nonfinite > 0:
-                                t_finite_mask = torch.isfinite(flat_teacher_logits)
-                                if t_finite_mask.any():
-                                    print(f"      Finite teacher range: [{flat_teacher_logits[t_finite_mask].min():.4f}, {flat_teacher_logits[t_finite_mask].max():.4f}]")
+                    if hasattr(self.teacher, "model") and hasattr(self.teacher, "lm_head"):
+                        t_core = None
+                        # Paper-style qwen2 teacher: teacher.model(token_ids, last_model_state=..., ...)
+                        try:
+                            t_core = self.teacher.model(
+                                x,
+                                last_model_state=None,
+                                output_hidden_states=False,
+                                output_attentions=False,
+                                output_post_attention_hidden_states=False,
+                            )
+                        except TypeError:
+                            # HF-style teacher: teacher.model(input_ids=..., attention_mask=...)
+                            try:
+                                t_core = self.teacher.model(input_ids=x)
+                            except TypeError:
+                                # Last resort: call as positional (some HF models)
+                                try:
+                                    t_core = self.teacher.model(x)
+                                except Exception:
+                                    t_core = None
+
+                        if t_core is not None:
+                            t_hidden = getattr(t_core, "logits", None)
+                            if t_hidden is None:
+                                t_hidden = getattr(t_core, "last_hidden_state", None)
+                            if t_hidden is None and isinstance(t_core, (tuple, list)) and len(t_core) > 0 and torch.is_tensor(t_core[0]):
+                                t_hidden = t_core[0]
+                            # Expect [B, T, D]
+                            if torch.is_tensor(t_hidden) and t_hidden.dim() == 3:
+                                teacher_hidden_flat = t_hidden.reshape(-1, t_hidden.size(-1))
+
+                    # Fallback path: get full teacher logits (may OOM under FSDP).
+                    if teacher_hidden_flat is None:
+                        teacher_results = self.teacher.forward(x)
+                        if isinstance(teacher_results, tuple):
+                            teacher_logits = teacher_results[0]
+                        elif isinstance(results, torch.Tensor):
+                            teacher_logits = teacher_results
                         else:
-                            print(f"✅ Batch 0: Student logits range=[{flat_student_logits.min():.4f}, {flat_student_logits.max():.4f}], Teacher logits range=[{flat_teacher_logits.min():.4f}, {flat_teacher_logits.max():.4f}]")
+                            teacher_logits = teacher_results.logits
+                        flat_teacher_logits = teacher_logits.view(-1, teacher_logits.size(-1))
+
                 if not chunk_loss_calcs:
-                    distillation_loss = F.kl_div(
-                        F.log_softmax(flat_student_logits, dim=-1),
-                        F.log_softmax(flat_teacher_logits, dim=-1),
-                        log_target=True,
-                        reduction='batchmean'
-                    )
+                    # Prefer chunked KL even in the "non-chunk" mode if we can avoid full teacher logits.
+                    if teacher_hidden_flat is not None:
+                        distillation_loss = torch.tensor(0.0, device=flat_student_logits.device, dtype=torch.float)
+                        for c in range(0, flat_student_logits.size(0), chunk_len):
+                            student_log_softmax = F.log_softmax(flat_student_logits[c:c+chunk_len], dim=-1)
+                            teacher_logits_chunk = self.teacher.lm_head(teacher_hidden_flat[c:c+chunk_len])
+                            teacher_log_softmax = F.log_softmax(teacher_logits_chunk, dim=-1)
+                            distillation_loss = distillation_loss + F.kl_div(
+                                student_log_softmax,
+                                teacher_log_softmax,
+                                log_target=True,
+                                reduction='sum',
+                            )
+                        distillation_loss = distillation_loss / flat_labels.size(0)
+                    else:
+                        distillation_loss = F.kl_div(
+                            F.log_softmax(flat_student_logits, dim=-1),
+                            F.log_softmax(flat_teacher_logits, dim=-1),
+                            log_target=True,
+                            reduction='batchmean'
+                        )
                     # distillation_loss = F.kl_div(
                     #     torch.log( F.softmax(flat_student_logits, dim=-1) * flat_loss_mask + 1e-8 ),
                     #     F.softmax(flat_teacher_logits, dim=-1) * flat_loss_mask + 1e-8,
@@ -762,7 +897,11 @@ class LightningModelWrapper(pl.LightningModule):
                         #     reduction='sum',
                         # )
                         student_log_softmax = F.log_softmax(flat_student_logits[c:c+chunk_len], dim=-1)
-                        teacher_log_softmax = F.log_softmax(flat_teacher_logits[c:c+chunk_len], dim=-1)
+                        if teacher_hidden_flat is not None:
+                            teacher_logits_chunk = self.teacher.lm_head(teacher_hidden_flat[c:c+chunk_len])
+                            teacher_log_softmax = F.log_softmax(teacher_logits_chunk, dim=-1)
+                        else:
+                            teacher_log_softmax = F.log_softmax(flat_teacher_logits[c:c+chunk_len], dim=-1)
                         distillation_loss = distillation_loss + F.kl_div(
                              student_log_softmax,
                              teacher_log_softmax,

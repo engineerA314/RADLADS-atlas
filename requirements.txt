@@ -11,6 +11,9 @@ safetensors>=0.4.0
 flash-linear-attention>=0.0.1
 triton>=2.1.0
 assoc-scan>=0.0.2  # Provides AssocScan for efficient RNN parallelization (from lucidrains)
+# Optional dependency used by assoc-scan's accelerated path:
+# assoc_scan/assoc_scan.py imports `accelerated_scan.triton` when use_accelerated=True.
+accelerated-scan>=0.2.0
 
 # Training Infrastructure
 deepspeed>=0.12.0
@@ -27,6 +30,7 @@ tqdm>=4.65.0
 pyyaml>=6.0
 einops>=0.7.0
 python-dotenv>=1.0.0
+matplotlib>=3.9.0
 
 # Testing
 pytest>=7.0.0

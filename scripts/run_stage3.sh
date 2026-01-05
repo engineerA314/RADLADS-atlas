@@ -32,6 +32,7 @@ usage() {
     echo "  DATA_PREFIX, CTX_SCHEDULE, TOKENS, TOKENS_SCHEDULE, DEVICES, NUM_NODES, MICRO_BSZ, ACC_GRAD,"
     echo "  STRATEGY, GRAD_CP, DS_BUCKET_MB, WANDB_PROJECT, WANDB_MODE,"
     echo "  OMEGA_WINDOW, USE_OMEGA_GATE, USE_MOMENTUM, POLY_MODE, ATLAS_VARIANT, SLIDING_WINDOW,"
+    echo "  USE_ACCELERATED_SCAN, MEMORY_SCAN_CHUNK_LEN,"
     echo "  WITH_ALL_ABLATION, POLY_DEGREE, QK_NORM, QKV_CONV_KERNEL, USE_ROPE, USE_GROUPNORM"
 }
 
@@ -63,17 +64,24 @@ export DATA_PREFIX
 # Optional per-stage tokens list, e.g. TOKENS_SCHEDULE="50000000,50000000,250000000"
 TOKENS_SCHEDULE="${TOKENS_SCHEDULE:-}"
 
+# Full auto-resume (proper resume: optimizer + step counters)
+FULL_AUTO_RESUME="${FULL_AUTO_RESUME:-1}"
+FORCE_FRESH="${FORCE_FRESH:-0}"
+DRY_RUN="${DRY_RUN:-0}"
+
 # Check if checkpoint exists
 if [ ! -f "$STAGE2_CKPT" ]; then
     echo "❌ Checkpoint not found: $STAGE2_CKPT"
     exit 1
 fi
 
-# Check if data exists
-if [ ! -f "${DATA_PREFIX}.idx" ] || [ ! -f "${DATA_PREFIX}.bin" ]; then
-    echo "❌ Data not found: ${DATA_PREFIX}.idx/.bin"
-    echo "   If you want DCLM-10B, run: bash scripts/download_dclm.sh"
-    exit 1
+if [ "${DRY_RUN}" != "1" ]; then
+    # Check if data exists
+    if [ ! -f "${DATA_PREFIX}.idx" ] || [ ! -f "${DATA_PREFIX}.bin" ]; then
+        echo "❌ Data not found: ${DATA_PREFIX}.idx/.bin"
+        echo "   If you want DCLM-10B, run: bash scripts/download_dclm.sh"
+        exit 1
+    fi
 fi
 
 # Auto defaults for batch sizing (safe-ish; override explicitly for production)
@@ -120,6 +128,8 @@ if [ -n "${USE_MOMENTUM:-}" ]; then MODEL_ARGS+=(--model.use_momentum "${USE_MOM
 if [ -n "${POLY_MODE:-}" ]; then MODEL_ARGS+=(--model.poly_mode "${POLY_MODE}"); fi
 if [ -n "${ATLAS_VARIANT:-}" ]; then MODEL_ARGS+=(--model.atlas_variant "${ATLAS_VARIANT}"); fi
 if [ -n "${SLIDING_WINDOW:-}" ]; then MODEL_ARGS+=(--model.sliding_window "${SLIDING_WINDOW}"); fi
+if [ -n "${USE_ACCELERATED_SCAN:-}" ]; then MODEL_ARGS+=(--model.use_accelerated_scan "${USE_ACCELERATED_SCAN}"); fi
+if [ -n "${MEMORY_SCAN_CHUNK_LEN:-}" ]; then MODEL_ARGS+=(--model.memory_scan_chunk_len "${MEMORY_SCAN_CHUNK_LEN}"); fi
 
 echo "Configuration:"
 echo "  Stage 2 Checkpoint: $STAGE2_CKPT"
@@ -131,6 +141,7 @@ echo "  DEVICES x NUM_NODES: ${DEVICES} x ${NUM_NODES}"
 echo "  MICRO_BSZ: ${MICRO_BSZ}   ACC_GRAD: ${ACC_GRAD}"
 echo "  STRATEGY: ${STRATEGY}   GRAD_CP: ${GRAD_CP}   DS_BUCKET_MB: ${DS_BUCKET_MB}"
 echo "  WANDB_MODE: ${WANDB_MODE}   WANDB_PROJECT: ${WANDB_PROJECT:-<disabled>}"
+echo "  Memory: USE_ACCELERATED_SCAN=${USE_ACCELERATED_SCAN:-<default>}   MEMORY_SCAN_CHUNK_LEN=${MEMORY_SCAN_CHUNK_LEN:-<default>}"
 if [ "${WITH_ALL_ABLATION}" = "1" ]; then
     echo "  Ablation: WITH_ALL_ABLATION=1 (poly_degree=3, qk_norm=true, qkv_conv_kernel=4, use_rope=true, use_groupnorm=true)"
 else
@@ -176,10 +187,11 @@ for idx in "${!CTX_LIST[@]}"; do
         exit 1
     fi
 
-    # Compute data_size + magic_prime for (DATA_PREFIX, ctx)
-    export CTX_LEN="${ctx}"
-    read -r DATA_SIZE DATASET_SLOT MAGIC_PRIME MAGIC_RATIO < <(
-    python3 - <<'PY'
+    if [ "${DRY_RUN}" != "1" ]; then
+        # Compute data_size + magic_prime for (DATA_PREFIX, ctx)
+        export CTX_LEN="${ctx}"
+        read -r DATA_SIZE DATASET_SLOT MAGIC_PRIME MAGIC_RATIO < <(
+        python3 - <<'PY'
 import os, sys, math, random
 random.seed(1234)
 sys.path.insert(0, os.getcwd())
@@ -210,15 +222,75 @@ if max_offset + req_len > data_size:
 ratio = p / dataset_slot
 print(data_size, dataset_slot, p, f"{ratio:.6f}")
 PY
-    )
+        )
 
-    if [ "${step_tokens}" -gt "${DATA_SIZE}" ]; then
-        echo "❌ TOKENS (${step_tokens}) must be <= data_size (${DATA_SIZE}) for ctx=${ctx} (DATA_PREFIX=${DATA_PREFIX})"
-        exit 1
+        if [ "${step_tokens}" -gt "${DATA_SIZE}" ]; then
+            echo "❌ TOKENS (${step_tokens}) must be <= data_size (${DATA_SIZE}) for ctx=${ctx} (DATA_PREFIX=${DATA_PREFIX})"
+            exit 1
+        fi
+    else
+        DATA_SIZE="0"
+        DATASET_SLOT="0"
+        MAGIC_PRIME="0"
+        MAGIC_RATIO="0"
     fi
 
     PROJ_SUFFIX="atlas-stage3-ctx${ctx}"
     OUT_DIR="out/atlas-lmm-0b5-${PROJ_SUFFIX}"
+
+    # If already finished, skip step.
+    if [ "${DRY_RUN}" != "1" ] && [ -f "${OUT_DIR}/rwkv-final.pth" ] && [ "${FORCE_FRESH}" != "1" ]; then
+        echo "✅ Found existing final checkpoint for ctx=${ctx}. Skipping training step."
+        PREV_CKPT="${OUT_DIR}/rwkv-final.pth"
+        FINAL_CKPT="${PREV_CKPT}"
+        continue
+    fi
+
+    # Full auto-resume for this ctx step (best-effort)
+    unset FULL_RESUME_CKPT_PATH || true
+    export FULL_RESUME=0
+    if [ "${FULL_AUTO_RESUME}" = "1" ] && [ "${FORCE_FRESH}" != "1" ]; then
+        if [ -n "${EXP_ID:-}" ] && [ -n "${GCS_BUCKET:-}" ] && [ -n "${GCS_PREFIX:-}" ]; then
+            STEP_LABEL="stage3-ctx${ctx}"
+            FULL_RESUME_LOCAL_DIR="${FULL_RESUME_LOCAL_DIR:-out/_full_resume/${EXP_ID:-unknown}/${STEP_LABEL}}"
+            FULL_RESUME_LOCAL_CKPT="${FULL_RESUME_LOCAL_DIR}/full-resume.ckpt"
+            FULL_RESUME_LOCAL_META="${FULL_RESUME_LOCAL_DIR}/full-resume.meta.json"
+
+            FULL_GCS_DIR="${GCS_BUCKET%/}/${GCS_PREFIX#/}/${EXP_ID}/_latest/full_resume/${STEP_LABEL}"
+            FULL_GCS_CKPT="${FULL_GCS_DIR}/full-resume.ckpt"
+            FULL_GCS_META="${FULL_GCS_DIR}/full-resume.meta.json"
+
+            if gsutil ls "${FULL_GCS_META}" >/dev/null 2>&1; then
+                mkdir -p "${FULL_RESUME_LOCAL_DIR}"
+                echo "🔁 Found FULL resume checkpoint in GCS for ${STEP_LABEL}. Downloading..."
+                gsutil cp -q "${FULL_GCS_META}" "${FULL_RESUME_LOCAL_META}" || true
+                CKPT_IS_DIR="$(
+                FULL_RESUME_LOCAL_META="${FULL_RESUME_LOCAL_META}" python3 - <<'PY'
+import json, os
+try:
+    with open(os.environ["FULL_RESUME_LOCAL_META"], "r") as f:
+        meta = json.load(f)
+    print("1" if bool(meta.get("ckpt_is_dir", False)) else "0")
+except Exception:
+    print("0")
+PY
+                )"
+                if [ "${CKPT_IS_DIR}" = "1" ]; then
+                    gsutil -m rsync -r "${FULL_GCS_CKPT}" "${FULL_RESUME_LOCAL_CKPT}" || true
+                else
+                    gsutil cp -q "${FULL_GCS_CKPT}" "${FULL_RESUME_LOCAL_CKPT}" || true
+                fi
+
+                if [ -e "${FULL_RESUME_LOCAL_CKPT}" ] && [ -f "${FULL_RESUME_LOCAL_META}" ]; then
+                    export FULL_RESUME_CKPT_PATH="${FULL_RESUME_LOCAL_CKPT}"
+                    export FULL_RESUME=1
+                    echo "✅ FULL auto-resume enabled for ${STEP_LABEL}: ckpt_path=${FULL_RESUME_CKPT_PATH}"
+                else
+                    echo "⚠️ FULL resume files failed to download for ${STEP_LABEL}; starting fresh."
+                fi
+            fi
+        fi
+    fi
 
     echo "----------------------------------------------"
     echo "Stage 3 step $((idx + 1))/${#CTX_LIST[@]}: ctx=${ctx}"
@@ -228,6 +300,14 @@ PY
     echo "  TOKENS (my_exit_tokens): ${step_tokens}"
     echo "  Output dir: ${OUT_DIR}"
     echo "----------------------------------------------"
+
+    if [ "${DRY_RUN}" = "1" ]; then
+        echo "DRY_RUN: would run ctx=${ctx} with PROJ_SUFFIX=${PROJ_SUFFIX}"
+        echo "FULL_RESUME=${FULL_RESUME}"
+        echo "FULL_RESUME_CKPT_PATH=${FULL_RESUME_CKPT_PATH:-}"
+        FINAL_CKPT="${PREV_CKPT}"
+        continue
+    fi
 
     # Run training (CE only, no teacher)
     python3 train.py \
