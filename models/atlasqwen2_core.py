@@ -23,6 +23,8 @@ state_dict key naming (locked):
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, NamedTuple
+import os
+import json
 
 import torch
 import torch.nn as nn
@@ -30,6 +32,198 @@ import torch.utils.checkpoint
 from torch import Tensor
 
 from models.atlas_memory import RNNMemory, RNNMemState, state_detach
+
+
+# ============================================================================
+# NaN debug helpers (backward hook capture)
+# ============================================================================
+
+_NAN_DEBUG_BWD_DUMPED: set[tuple[int, int, int, str]] = set()
+
+
+def _nan_debug_bwd_steps() -> set[int]:
+    raw = str(os.environ.get("NAN_DEBUG_BWD_STEPS", "") or "").strip()
+    if raw == "":
+        return set()
+    out: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if part == "":
+            continue
+        try:
+            out.add(int(part))
+        except Exception:
+            continue
+    return out
+
+
+def _nan_debug_bwd_layers() -> set[int] | None:
+    raw = str(os.environ.get("NAN_DEBUG_BWD_LAYERS", "") or "").strip()
+    if raw == "" or raw.lower() == "all":
+        return None
+    out: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if part == "":
+            continue
+        try:
+            out.add(int(part))
+        except Exception:
+            continue
+    return out
+
+
+def _nan_debug_bwd_ranks() -> set[int] | None:
+    raw = str(os.environ.get("NAN_DEBUG_BWD_RANKS", "") or "").strip()
+    if raw == "" or raw.lower() == "all":
+        return None
+    out: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if part == "":
+            continue
+        try:
+            out.add(int(part))
+        except Exception:
+            continue
+    return out
+
+
+def _nan_debug_bwd_tags() -> set[str] | None:
+    raw = str(os.environ.get("NAN_DEBUG_BWD_TAGS", "") or "").strip()
+    if raw == "" or raw.lower() == "all":
+        return None
+    return {p.strip() for p in raw.split(",") if p.strip()}
+
+
+def _nan_debug_bwd_dir() -> str:
+    return str(os.environ.get("NAN_DEBUG_BWD_DIR", "/tmp/radlads_nan_debug_bwd"))
+
+
+def _nan_debug_bwd_dump_tensors_enabled() -> bool:
+    raw = str(os.environ.get("NAN_DEBUG_BWD_DUMP_TENSORS", "0") or "").strip().lower()
+    return raw in ("1", "true", "yes")
+
+
+def _nan_debug_bwd_max_elems() -> int:
+    raw = str(os.environ.get("NAN_DEBUG_BWD_MAX_ELEMS", "2000000") or "").strip()
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return 2000000
+
+
+def _nan_debug_bwd_once() -> bool:
+    raw = str(os.environ.get("NAN_DEBUG_BWD_ONCE", "1") or "").strip().lower()
+    return raw in ("1", "true", "yes")
+
+
+def _nan_debug_bwd_context() -> dict:
+    try:
+        from atlasattn import get_nan_debug_context
+        return get_nan_debug_context()
+    except Exception:
+        return {}
+
+
+def _nan_debug_bwd_should_attach(layer_idx: int, tag: str) -> tuple[bool, int | None, int, tuple[int, int, int, str]]:
+    steps = _nan_debug_bwd_steps()
+    if not steps:
+        return False, None, 0, (0, 0, 0, tag)
+    ctx = _nan_debug_bwd_context()
+    batch_idx = ctx.get("batch_idx", None)
+    if batch_idx is None or int(batch_idx) not in steps:
+        return False, None, 0, (0, 0, 0, tag)
+    try:
+        import torch.distributed as dist
+        is_dist = dist.is_available() and dist.is_initialized()
+        rank = int(dist.get_rank()) if is_dist else 0
+    except Exception:
+        rank = 0
+    ranks = _nan_debug_bwd_ranks()
+    if ranks is not None and rank not in ranks:
+        return False, int(batch_idx), rank, (int(batch_idx), int(layer_idx), rank, tag)
+    layers = _nan_debug_bwd_layers()
+    if layers is not None and layer_idx not in layers:
+        return False, int(batch_idx), rank, (int(batch_idx), int(layer_idx), rank, tag)
+    tags = _nan_debug_bwd_tags()
+    if tags is not None and tag not in tags:
+        return False, int(batch_idx), rank, (int(batch_idx), int(layer_idx), rank, tag)
+    key = (int(batch_idx), int(layer_idx), int(rank), tag)
+    if _nan_debug_bwd_once() and key in _NAN_DEBUG_BWD_DUMPED:
+        return False, int(batch_idx), rank, key
+    return True, int(batch_idx), rank, key
+
+
+def _nan_debug_bwd_dump(tag: str, layer_idx: int, grad: Tensor, batch_idx: int, rank: int, key: tuple[int, int, int, str]) -> None:
+    if _nan_debug_bwd_once():
+        _NAN_DEBUG_BWD_DUMPED.add(key)
+    try:
+        flat = grad.detach().reshape(-1)
+        stats = {
+            "shape": list(grad.shape),
+            "dtype": str(grad.dtype),
+            "device": str(grad.device),
+            "numel": int(flat.numel()),
+            "nan": int(torch.isnan(flat).sum().item()),
+            "inf": int(torch.isinf(flat).sum().item()),
+        }
+        finite = torch.isfinite(flat)
+        if finite.any():
+            f = flat[finite].float()
+            stats.update(
+                absmax=float(f.abs().max().item()),
+                mean=float(f.mean().item()),
+                std=float(f.std(unbiased=False).item()) if f.numel() > 1 else 0.0,
+            )
+    except Exception:
+        stats = {"error": "stats_failed"}
+
+    payload = {
+        "batch_idx": int(batch_idx),
+        "layer_idx": int(layer_idx),
+        "rank": int(rank),
+        "tag": tag,
+        "grad": stats,
+    }
+    out_dir = _nan_debug_bwd_dir()
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception:
+        out_dir = "/tmp"
+    out_path = os.path.join(out_dir, f"bwd_grad_rank{rank}_step{int(batch_idx)}_layer{int(layer_idx)}_{tag}.json")
+    try:
+        with open(out_path, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception:
+        pass
+
+    if _nan_debug_bwd_dump_tensors_enabled() and grad.numel() <= _nan_debug_bwd_max_elems():
+        try:
+            tensor_path = os.path.join(out_dir, f"bwd_grad_rank{rank}_step{int(batch_idx)}_layer{int(layer_idx)}_{tag}.pt")
+            torch.save(grad.detach().cpu(), tensor_path)
+        except Exception:
+            pass
+
+
+def _nan_debug_bwd_hook(tensor: Tensor, *, tag: str, layer_idx: int) -> None:
+    if tensor is None or (not torch.is_tensor(tensor)):
+        return
+    if not tensor.is_floating_point():
+        return
+    ok, batch_idx, rank, key = _nan_debug_bwd_should_attach(layer_idx, tag)
+    if not ok:
+        return
+
+    def _hook(grad: Tensor) -> None:
+        if grad is None:
+            return
+        _nan_debug_bwd_dump(tag, layer_idx, grad, int(batch_idx), int(rank), key)
+
+    try:
+        tensor.register_hook(_hook)
+    except Exception:
+        pass
 
 
 # ============================================================================
@@ -107,6 +301,7 @@ class AtlasConfig:
     use_momentum: bool = True
     omega_window: int = 4  # Omega window size (must be >= 2)
     use_omega_gate: bool = True  # Enable learnable omega gate
+    use_cuda: bool = False  # Enable CUDA backend for 50-100x speedup (requires omega_window=16)
     poly_degree: int = 1
     poly_mode: str = 'off'
     qk_norm: bool = True
@@ -193,11 +388,18 @@ class AtlasRMSNorm(nn.Module):
         self.variance_epsilon = eps
     
     def forward(self, hidden_states: Tensor) -> Tensor:
+        layer_idx = int(getattr(self, "layer_idx", -1))
+        tag_prefix = getattr(self, "debug_tag", None)
+        if tag_prefix:
+            _nan_debug_bwd_hook(hidden_states, tag=f"{tag_prefix}_in", layer_idx=layer_idx)
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        out = self.weight * hidden_states.to(input_dtype)
+        if tag_prefix:
+            _nan_debug_bwd_hook(out, tag=f"{tag_prefix}_out", layer_idx=layer_idx)
+        return out
 
 
 # ============================================================================
@@ -215,7 +417,17 @@ class AtlasMLP(nn.Module):
         self.act_fn = nn.SiLU()
     
     def forward(self, x: Tensor) -> Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        layer_idx = int(getattr(self, "layer_idx", -1))
+        _nan_debug_bwd_hook(x, tag="mlp_in", layer_idx=layer_idx)
+        gate = self.gate_proj(x)
+        _nan_debug_bwd_hook(gate, tag="mlp_gate", layer_idx=layer_idx)
+        up = self.up_proj(x)
+        _nan_debug_bwd_hook(up, tag="mlp_up", layer_idx=layer_idx)
+        act = self.act_fn(gate)
+        _nan_debug_bwd_hook(act, tag="mlp_act", layer_idx=layer_idx)
+        out = self.down_proj(act * up)
+        _nan_debug_bwd_hook(out, tag="mlp_out", layer_idx=layer_idx)
+        return out
 
 
 # ============================================================================
@@ -305,6 +517,13 @@ class AtlasLMMBlock(nn.Module):
         # Layer norms
         self.input_layernorm = AtlasRMSNorm(config.n_embd, eps=config.rms_norm_eps)
         self.post_memory_layernorm = AtlasRMSNorm(config.n_embd, eps=config.rms_norm_eps)
+        try:
+            self.input_layernorm.layer_idx = int(layer_idx)
+            self.input_layernorm.debug_tag = "input_ln"
+            self.post_memory_layernorm.layer_idx = int(layer_idx)
+            self.post_memory_layernorm.debug_tag = "post_mem_ln"
+        except Exception:
+            pass
         
         # Memory module (replaces attention)
         self.memory = RNNMemory(
@@ -315,6 +534,7 @@ class AtlasLMMBlock(nn.Module):
             use_momentum=config.use_momentum,
             omega_window=config.omega_window,
             use_omega_gate=config.use_omega_gate,
+            use_cuda=config.use_cuda,
             poly_degree=config.poly_degree,
             poly_mode=config.poly_mode,
             qk_norm=config.qk_norm,
@@ -326,9 +546,25 @@ class AtlasLMMBlock(nn.Module):
             use_accelerated_scan=getattr(config, "use_accelerated_scan", True),
             scan_chunk_len=getattr(config, "memory_scan_chunk_len", None),
         )
+
+        # Expose layer index for omega debug hooks.
+        try:
+            self.memory.layer_idx = int(layer_idx)
+            if hasattr(self.memory, "cell"):
+                self.memory.cell.layer_idx = int(layer_idx)
+        except Exception:
+            pass
         
         # MLP
         self.mlp = AtlasMLP(config.n_embd, config.dim_ffn)
+        try:
+            self.mlp.layer_idx = int(layer_idx)
+        except Exception:
+            pass
+        try:
+            self.mlp.layer_idx = int(layer_idx)
+        except Exception:
+            pass
     
     def forward(
         self,
@@ -349,16 +585,22 @@ class AtlasLMMBlock(nn.Module):
         # Memory path with residual
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        _nan_debug_bwd_hook(hidden_states, tag="post_input_ln", layer_idx=self.layer_idx)
         
         mem_state = layer_state.memory_state if layer_state is not None else None
         hidden_states, new_mem_state = self.memory(hidden_states, mem_state)
+        _nan_debug_bwd_hook(hidden_states, tag="mem_out", layer_idx=self.layer_idx)
         hidden_states = residual + hidden_states
+        _nan_debug_bwd_hook(hidden_states, tag="post_mem_resid", layer_idx=self.layer_idx)
         
         # MLP path with residual
         residual = hidden_states
         hidden_states = self.post_memory_layernorm(hidden_states)
+        _nan_debug_bwd_hook(hidden_states, tag="post_mem_ln", layer_idx=self.layer_idx)
         hidden_states = self.mlp(hidden_states)
+        _nan_debug_bwd_hook(hidden_states, tag="mlp_out", layer_idx=self.layer_idx)
         hidden_states = residual + hidden_states
+        _nan_debug_bwd_hook(hidden_states, tag="post_mlp_resid", layer_idx=self.layer_idx)
         
         new_layer_state = AtlasLayerState(memory_state=new_mem_state)
         return hidden_states, new_layer_state
@@ -389,6 +631,15 @@ class AtlasMALBlock(nn.Module):
         self.input_layernorm = AtlasRMSNorm(config.n_embd, eps=config.rms_norm_eps)
         self.post_memory_layernorm = AtlasRMSNorm(config.n_embd, eps=config.rms_norm_eps)
         self.post_attn_layernorm = AtlasRMSNorm(config.n_embd, eps=config.rms_norm_eps)
+        try:
+            self.input_layernorm.layer_idx = int(layer_idx)
+            self.input_layernorm.debug_tag = "input_ln"
+            self.post_memory_layernorm.layer_idx = int(layer_idx)
+            self.post_memory_layernorm.debug_tag = "post_mem_ln"
+            self.post_attn_layernorm.layer_idx = int(layer_idx)
+            self.post_attn_layernorm.debug_tag = "post_attn_ln"
+        except Exception:
+            pass
         
         # Memory module
         self.memory = RNNMemory(
@@ -399,6 +650,7 @@ class AtlasMALBlock(nn.Module):
             use_momentum=config.use_momentum,
             omega_window=config.omega_window,
             use_omega_gate=config.use_omega_gate,
+            use_cuda=config.use_cuda,
             poly_degree=config.poly_degree,
             poly_mode=config.poly_mode,
             qk_norm=config.qk_norm,
@@ -410,6 +662,14 @@ class AtlasMALBlock(nn.Module):
             use_accelerated_scan=getattr(config, "use_accelerated_scan", True),
             scan_chunk_len=getattr(config, "memory_scan_chunk_len", None),
         )
+
+        # Expose layer index for omega debug hooks.
+        try:
+            self.memory.layer_idx = int(layer_idx)
+            if hasattr(self.memory, "cell"):
+                self.memory.cell.layer_idx = int(layer_idx)
+        except Exception:
+            pass
         
         # Sliding window attention
         sliding_window = getattr(config, 'sliding_window', 512)
@@ -442,22 +702,31 @@ class AtlasMALBlock(nn.Module):
         # Memory path with residual
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        _nan_debug_bwd_hook(hidden_states, tag="post_input_ln", layer_idx=self.layer_idx)
         
         mem_state = layer_state.memory_state if layer_state is not None else None
         hidden_states, new_mem_state = self.memory(hidden_states, mem_state)
+        _nan_debug_bwd_hook(hidden_states, tag="mem_out", layer_idx=self.layer_idx)
         hidden_states = residual + hidden_states
+        _nan_debug_bwd_hook(hidden_states, tag="post_mem_resid", layer_idx=self.layer_idx)
         
         # Attention path with residual
         residual = hidden_states
         hidden_states = self.post_memory_layernorm(hidden_states)
+        _nan_debug_bwd_hook(hidden_states, tag="post_mem_ln", layer_idx=self.layer_idx)
         hidden_states = self.attention(hidden_states)
+        _nan_debug_bwd_hook(hidden_states, tag="attn_out", layer_idx=self.layer_idx)
         hidden_states = residual + hidden_states
+        _nan_debug_bwd_hook(hidden_states, tag="post_attn_resid", layer_idx=self.layer_idx)
         
         # MLP path with residual
         residual = hidden_states
         hidden_states = self.post_attn_layernorm(hidden_states)
+        _nan_debug_bwd_hook(hidden_states, tag="post_attn_ln", layer_idx=self.layer_idx)
         hidden_states = self.mlp(hidden_states)
+        _nan_debug_bwd_hook(hidden_states, tag="mlp_out", layer_idx=self.layer_idx)
         hidden_states = residual + hidden_states
+        _nan_debug_bwd_hook(hidden_states, tag="post_mlp_resid", layer_idx=self.layer_idx)
         
         new_layer_state = AtlasLayerState(memory_state=new_mem_state)
         return hidden_states, new_layer_state

@@ -15,6 +15,7 @@ NOTE: RNNMemoryCell (omega_window=1) is DEPRECATED and should not be used.
 
 import pytest
 import torch
+import torch.nn as nn
 
 from models.atlas_memory import (
     RNNMemoryCell,
@@ -22,6 +23,7 @@ from models.atlas_memory import (
     OmegaRNNMemoryCell,
     RNNMemState,
     state_detach,
+    PolynomialFeatureMap,
 )
 
 
@@ -191,6 +193,85 @@ class TestRNNMemoryFactory:
         assert isinstance(state, RNNMemState)
 
 
+class TestPolynomialFeatureMapPolysketch:
+    """Tests for polysketch + projection feature map."""
+
+    def _seed_all(self, seed: int, device: torch.device) -> None:
+        torch.manual_seed(seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(seed)
+
+    def test_polysketch_trainable_params(self, device, dtype):
+        """polysketch exposes trainable coeff + projection."""
+        self._seed_all(123, device)
+        fmap = PolynomialFeatureMap(dim=8, degree=2, mode="polysketch", sketch_size=8).to(device, dtype)
+
+        assert isinstance(fmap.proj, nn.Linear)
+        assert fmap.proj.weight.requires_grad is True
+        assert fmap.poly_coeff.requires_grad is True
+        assert fmap.poly_coeff.shape == (3,)
+
+        params = dict(fmap.named_parameters())
+        assert "proj.weight" in params
+        assert "poly_coeff" in params
+        assert "sketch_h1" not in params
+        assert "sketch_s1" not in params
+
+    def test_polysketch_constant_term(self, device, dtype):
+        """Constant term should flow through projection."""
+        self._seed_all(7, device)
+        dim = 4
+        fmap = PolynomialFeatureMap(dim=dim, degree=2, mode="polysketch", sketch_size=4).to(device, dtype)
+        x = torch.randn(2, 3, dim, device=device, dtype=dtype)
+
+        with torch.no_grad():
+            fmap.proj.weight.zero_()
+            fmap.proj.weight[:, 0] = 1.0  # pick constant term only
+            fmap.poly_coeff.copy_(torch.tensor([2.0, 0.0, 0.0], device=device, dtype=dtype))
+
+        y = fmap(x)
+        expected = torch.full_like(y, 2.0)
+        assert torch.allclose(y, expected, atol=1e-5)
+
+    def test_polysketch_linear_coeff_scaling(self, device, dtype):
+        """Linear term should scale with its coefficient."""
+        self._seed_all(11, device)
+        dim = 5
+        fmap = PolynomialFeatureMap(dim=dim, degree=2, mode="polysketch", sketch_size=6).to(device, dtype)
+        x = torch.randn(2, 4, dim, device=device, dtype=dtype)
+
+        with torch.no_grad():
+            fmap.proj.weight.zero_()
+            for i in range(dim):
+                fmap.proj.weight[i, 1 + i] = 1.0  # pick linear term only
+            fmap.poly_coeff.copy_(torch.tensor([0.0, 3.0, 0.0], device=device, dtype=dtype))
+
+        y = fmap(x)
+        expected = x * 3.0
+        assert torch.allclose(y, expected, atol=1e-5)
+
+    def test_polysketch_quadratic_coeff_scaling(self, device, dtype):
+        """Sketch term should scale linearly with its coefficient."""
+        self._seed_all(19, device)
+        dim = 3
+        sketch_size = 5
+        fmap = PolynomialFeatureMap(dim=dim, degree=2, mode="polysketch", sketch_size=sketch_size).to(device, dtype)
+        x = torch.randn(2, 2, dim, device=device, dtype=dtype)
+
+        sketch_start = 1 + dim
+        with torch.no_grad():
+            fmap.proj.weight.zero_()
+            fmap.proj.weight[0, sketch_start] = 1.0  # pick first sketch feature
+            fmap.poly_coeff.copy_(torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype))
+
+        y1 = fmap(x)
+        with torch.no_grad():
+            fmap.poly_coeff.copy_(torch.tensor([0.0, 0.0, 2.0], device=device, dtype=dtype))
+        y2 = fmap(x)
+
+        assert torch.allclose(y2, y1 * 2.0, atol=1e-5)
+
+
 class TestOmegaRNNMemoryCell:
     """Tests for the Omega (sliding window) variant."""
     
@@ -209,8 +290,8 @@ class TestOmegaRNNMemoryCell:
         state = cell.init_state(batch=2, device=device, dtype=dtype)
         
         assert state.omega_buffer is not None
-        # Shape: [batch*heads, omega_window-1, dim_head, dim_head, 2]
-        assert state.omega_buffer.shape == (2 * 4, 3, 16, 16, 2)
+        # Shape: [batch*heads, omega_window-1, dim_head, dim_head] (Exact Refactor: 50% smaller!)
+        assert state.omega_buffer.shape == (2 * 4, 3, 16, 16)
     
     def test_forward_shape(self, tiny_memory_config, make_input, device, dtype):
         """Omega cell forward produces correct shapes."""
@@ -295,7 +376,7 @@ class TestOmegaWindowVariations:
         out, state = cell(x)
         
         assert out.shape == x.shape
-        assert state.omega_buffer.shape == (2 * 4, 1, 16, 16, 2)
+        assert state.omega_buffer.shape == (2 * 4, 1, 16, 16)  # Exact Refactor: 4D
     
     def test_omega_window_8(self, tiny_memory_config, make_input, device, dtype):
         """Test with omega_window=8."""
@@ -306,7 +387,7 @@ class TestOmegaWindowVariations:
         out, state = cell(x)
         
         assert out.shape == x.shape
-        assert state.omega_buffer.shape == (2 * 4, 7, 16, 16, 2)
+        assert state.omega_buffer.shape == (2 * 4, 7, 16, 16)  # Exact Refactor: 4D
     
     def test_omega_window_streaming(self, tiny_memory_config, make_input, seed, device, dtype):
         """Test streaming with omega_window=4."""

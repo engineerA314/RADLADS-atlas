@@ -84,6 +84,7 @@ def config_to_atlas_config(config) -> AtlasConfig:
         use_momentum=getattr(model_cfg, 'use_momentum', True),
         omega_window=getattr(model_cfg, 'omega_window', 4),
         use_omega_gate=getattr(model_cfg, 'use_omega_gate', True),
+        use_cuda=getattr(model_cfg, 'use_cuda', False),
         poly_degree=getattr(model_cfg, 'poly_degree', 1),
         poly_mode=getattr(model_cfg, 'poly_mode', 'off'),
         qk_norm=getattr(model_cfg, 'qk_norm', True),
@@ -255,7 +256,6 @@ class Model_atlasqwen2(nn.Module):
         hidden_states, new_atlas_state, all_hidden_states = self.model(
             token_ids, atlas_state, output_hidden_states
         )
-        
         # Apply LM head
         logits = self.lm_head(hidden_states)
         

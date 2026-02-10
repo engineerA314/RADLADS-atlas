@@ -55,6 +55,7 @@ export CTX_LEN
 # Full auto-resume (proper resume: optimizer + step counters)
 FULL_AUTO_RESUME="${FULL_AUTO_RESUME:-1}"
 FORCE_FRESH="${FORCE_FRESH:-0}"
+FULL_RESUME_ALLOW_NO_META="${FULL_RESUME_ALLOW_NO_META:-0}"
 
 FULL_RESUME_STAGE_LABEL="stage2"
 FULL_RESUME_LOCAL_DIR="${FULL_RESUME_LOCAL_DIR:-out/_full_resume/${EXP_ID:-unknown}/${FULL_RESUME_STAGE_LABEL}}"
@@ -110,6 +111,20 @@ PY
                 fi
             else
                 echo "⚠️ FULL resume files failed to download; falling back."
+            fi
+        elif [ "${FULL_RESUME_ALLOW_NO_META}" = "1" ]; then
+            FULL_GCS_CKPT_DIR="${FULL_GCS_CKPT%/}/"
+            if gsutil ls "${FULL_GCS_CKPT_DIR}" >/dev/null 2>&1; then
+                mkdir -p "${FULL_RESUME_LOCAL_CKPT}"
+                echo "⚠️ FULL resume meta missing. Forcing resume from checkpoint dir (no ctx_len check)."
+                gsutil -m rsync -r "${FULL_GCS_CKPT_DIR}" "${FULL_RESUME_LOCAL_CKPT}/" || true
+                if [ -e "${FULL_RESUME_LOCAL_CKPT}" ]; then
+                    export FULL_RESUME_CKPT_PATH="${FULL_RESUME_LOCAL_CKPT}"
+                    export FULL_RESUME=1
+                    echo "✅ FULL auto-resume enabled (no meta): ckpt_path=${FULL_RESUME_CKPT_PATH}"
+                else
+                    echo "⚠️ FULL resume checkpoint dir failed to download; falling back."
+                fi
             fi
         fi
     fi

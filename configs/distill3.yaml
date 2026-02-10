@@ -10,14 +10,14 @@ train:
 
   data_type: "binidx" 
   data_file: "data/dclm-10B" #"data/minipile_qwen2" 
-  my_exit_tokens: 250000000 #1491785955
+  my_exit_tokens: 100000000 #1491785955
   magic_prime: 2929793 # 2913641 # 364193
 
   optimizer: dsfusedadamw
   lr_wait: 0.8
-  lr_decay_type: linear
-  lr_init: 7e-6
-  lr_final: 7e-6
+  lr_decay_type: none
+  lr_init: 1e-5
+  lr_final: 1e-5
   warmup_steps: 50 
   beta1: 0.9 
   beta2: 0.95 

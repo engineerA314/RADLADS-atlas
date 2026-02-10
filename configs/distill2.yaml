@@ -17,7 +17,7 @@ train:
   #optimizer: adamwschedulefree
   lr_wait: 0.833
   lr_endpoint: 0.875
-  lr_decay_type: cos
+  lr_decay_type: none
   lr_init: 1e-5
   lr_final: 1e-5
   lr2_init: 1e-5

@@ -93,6 +93,8 @@ class Atlas_Config(Transformer_Config):
     # - memory_scan_chunk_len: if set, chunk scan to reduce peak memory; None disables chunking
     use_accelerated_scan:bool = True
     memory_scan_chunk_len:int | None = None
+    # CUDA backend (50-100x speedup, requires omega_window=16 and A100 GPU)
+    use_cuda:bool = False  # Enable custom CUDA kernels for Atlas memory
     # Normalization options (for ablation study)
     use_groupnorm:bool = False  # Use GroupNorm in attention
     use_rope:bool = False  # Use Rotary Position Embedding

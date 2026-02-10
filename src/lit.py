@@ -84,6 +84,78 @@ class LightningModelWrapper(pl.LightningModule):
 
         self.trainer = trainer
 
+    def _should_sync_module_states(self) -> bool:
+        """
+        Decide whether we must explicitly sync parameters/buffers across ranks.
+
+        Why this exists:
+        - This codebase sometimes materializes parameters via meta/to_empty and/or loads weights on rank0 only.
+        - For DS1/DS2 (and DDP), parameters are replicated across ranks, so we must broadcast from rank0.
+        - For FSDP / ZeRO-3, parameters may be sharded or intentionally left on meta on non-rank0, so do NOT sync here.
+        """
+        strategy_name = str(getattr(self.config.train, "strategy", "") or "")
+        if "fsdp" in strategy_name:
+            return False
+        if "deepspeed_stage_3" in strategy_name:
+            return False
+        return True
+
+    def _sync_module_states_from_rank0(self, module: nn.Module) -> None:
+        import torch.distributed as dist
+        if module is None:
+            return
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        if not self._should_sync_module_states():
+            return
+
+        # Broadcast parameters + buffers from rank0 to all ranks.
+        # This guarantees all ranks start from identical weights even if only rank0 reset/loaded them.
+        for p in module.parameters():
+            if p is None:
+                continue
+            dist.broadcast(p.data, src=0)
+        for b in module.buffers():
+            if b is None:
+                continue
+            dist.broadcast(b.data, src=0)
+
+    def _nan_stats(self, t: torch.Tensor) -> dict:
+        """
+        Robust tensor stats for NaN/Inf debugging.
+        Computes stats over finite values only (so min/max aren't NaN).
+        """
+        try:
+            flat = t.detach().reshape(-1)
+        except Exception:
+            return {"error": "reshape_failed"}
+
+        finite = torch.isfinite(flat)
+        n = int(flat.numel())
+        n_finite = int(finite.sum().item()) if finite.numel() > 0 else 0
+        n_nan = int(torch.isnan(flat).sum().item()) if flat.numel() > 0 else 0
+        n_inf = int(torch.isinf(flat).sum().item()) if flat.numel() > 0 else 0
+
+        out = {
+            "shape": list(t.shape),
+            "dtype": str(t.dtype),
+            "device": str(t.device),
+            "numel": n,
+            "finite": n_finite,
+            "nan": n_nan,
+            "inf": n_inf,
+        }
+        if n_finite > 0:
+            f = flat[finite].float()
+            out.update({
+                "min": float(f.min().item()),
+                "max": float(f.max().item()),
+                "mean": float(f.mean().item()),
+                "std": float(f.std(unbiased=False).item()) if f.numel() > 1 else 0.0,
+                "absmax": float(f.abs().max().item()),
+            })
+        return out
+
     def configure_model(self):
         if self.configured:
             return
@@ -100,13 +172,30 @@ class LightningModelWrapper(pl.LightningModule):
             self.teacher.eval()
             self.teacher.requires_grad_(False)            
 
-        # FIXME - not sure how the resetted and/or loaded weights are getting transferred to the other GPUs on DS1, but it seems to be working??!
+        # IMPORTANT:
+        # For DS1/DS2, parameters are replicated across ranks.
+        # If we reset/load weights on rank0 only, we MUST broadcast to all ranks to avoid divergence/NaNs.
         if self.trainer.global_rank == 0:
             if 'deepspeed_stage_3' not in self.config.train.strategy:
                 # For full framework resume, Lightning will restore weights from ckpt_path.
                 # Don't also do our own weights-loading/reset path.
                 if str(os.environ.get("FULL_RESUME", "0")).strip() != "1":
                     self.load_weights()
+
+        # Ensure all ranks see identical weights/buffers (DS1/DS2 / DDP-style replicated params).
+        # Do this after any rank0-only reset/load above.
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized() and self._should_sync_module_states():
+                dist.barrier()
+                self._sync_module_states_from_rank0(self.model)
+                if self.teacher is not None:
+                    self._sync_module_states_from_rank0(self.teacher)
+                dist.barrier()
+        except Exception as _e:
+            # Avoid hard failure here; training will still surface issues if sync is required.
+            # (We keep this non-fatal because some strategies may not initialize dist at this point.)
+            pass
 
         # if self.config.train.strategy == 'fsdp':
         #     from functools import partial
@@ -495,8 +584,7 @@ class LightningModelWrapper(pl.LightningModule):
                         error_msgs=error_msgs,
                     )
                     if len(error_msgs) > 0:
-                        print("ERROR", error_msgs)
-                        exit(0)
+                        raise RuntimeError(f"ZeRO-3 load_state_dict failed under prefix='{prefix}': {error_msgs}")
 
             for name, child in module._modules.items():
                 if child is not None:
@@ -620,6 +708,14 @@ class LightningModelWrapper(pl.LightningModule):
             distill_chunk_len = 256 if "fsdp" in str(self.config.train.strategy).lower() else 512
 
         x, y = batch
+        debug_ctx: dict = {}
+        # Expose batch_idx to backward/optimizer hooks for correlated logging
+        self._nan_debug_last_batch_idx = batch_idx
+        try:
+            from atlasattn import set_nan_debug_context
+            set_nan_debug_context(batch_idx=int(batch_idx), global_step=self.get_real_global_step())
+        except Exception:
+            pass
         
         print_gpu_memory("step_start")
 
@@ -656,6 +752,8 @@ class LightningModelWrapper(pl.LightningModule):
                     for layer in self.model.model.layers:
                         if hasattr(layer.self_attn, '_last_alignment_loss') and layer.self_attn._last_alignment_loss is not None:
                             losses.append(layer.self_attn._last_alignment_loss)
+                    if len(losses) > 0:
+                        debug_ctx["hf_alignment_losses"] = losses
                     
                     if len(losses) > 0:
                         training_loss = torch.stack(losses, dim=0).mean()
@@ -773,6 +871,9 @@ class LightningModelWrapper(pl.LightningModule):
             #flat_loss_mask = loss_mask.view(-1)
 
             reported_loss = training_loss = distillation_loss = ce_loss = torch.tensor(0.0, device=flat_student_logits.device, dtype=flat_student_logits.dtype)
+            # Keep some useful debug context around if we later see NaNs.
+            debug_ctx["flat_student_logits"] = flat_student_logits
+            debug_ctx["flat_labels"] = flat_labels
 
             chunk_loss_calcs = self.config.train.attention_distillation_stage in (-1, 2, 21, 31)
             chunk_len = distill_chunk_len
@@ -919,17 +1020,19 @@ class LightningModelWrapper(pl.LightningModule):
                 if batch_idx % 10 == 0:
                     print(f"kl_div:{distillation_loss.item()}, ce_loss:{ce_loss.item()}")
 
-        if reported_loss.isinf().any():
-            raise Exception("reported loss was infinite")
+        skip_nan_check = (os.environ.get("SKIP_NAN_CHECK", "") or "").strip().lower() in ("1", "true", "yes")
+        if not skip_nan_check:
+            if reported_loss.isinf().any():
+                raise Exception("reported loss was infinite")
 
-        if reported_loss.isnan().any():
-            raise Exception("reported loss was NaN")
+            if reported_loss.isnan().any():
+                raise Exception("reported loss was NaN")
 
-        if training_loss.isinf().any():
-            raise Exception("loss was infinite")
+            if training_loss.isinf().any():
+                raise Exception("loss was infinite")
 
-        if training_loss.isnan().any():
-            raise Exception("loss was NaN")
+            if training_loss.isnan().any():
+                raise Exception("loss was NaN")
 
         return reported_loss, training_loss, logits, preds, next_model_state
     
@@ -943,7 +1046,7 @@ class LightningModelWrapper(pl.LightningModule):
     def get_lr_progress(self):
         config = self.config
         warmup_tokens = config.train.warmup_steps * config.model.ctx_len * config.runtime.global_step_bsz
-        tokens_ex_warmup = abs(config.train.my_exit_tokens) - warmup_tokens
+        tokens_ex_warmup = max(1, abs(config.train.my_exit_tokens) - warmup_tokens)
         real_progress_ex_warmup = (self.get_real_tokens() - warmup_tokens) / tokens_ex_warmup
         real_progress_ex_warmup = max(0, min(1, real_progress_ex_warmup))
         lr_progress = (real_progress_ex_warmup - config.train.lr_wait) / (config.train.lr_endpoint - config.train.lr_wait)
@@ -974,7 +1077,7 @@ class LightningModelWrapper(pl.LightningModule):
                         #str += f'{name}:{metric_value:.4f} '
                     #str += f"{gb:.1f}gb {int(ms_per)}ms {ktok_per_sec:.2f}kT/s {self.total_runtime:.1f}sec"
                     #print(str)
-                    if len(self.config.train.wandb) > 0:
+                    if len(self.config.train.wandb) > 0 and hasattr(self.trainer, 'my_wandb'):
                         self.trainer.my_wandb.log(logdict, step=self.get_real_global_step(), commit=True)
 
         print("torch.cuda.memory_allocated: %fGB"%(torch.cuda.memory_allocated(0)/1024/1024/1024))
@@ -1002,7 +1105,7 @@ class LightningModelWrapper(pl.LightningModule):
                 logdict["val/" + name] = metric_value
                 str += f"{metric_value:.4f} "
                 metric.clear()
-            if len(self.config.train.wandb) > 0:
+            if len(self.config.train.wandb) > 0 and hasattr(self.trainer, 'my_wandb'):
                 self.trainer.my_wandb.log(logdict, step=self.get_real_global_step(), commit=True)
 
             console_clear_last_line()

@@ -26,7 +26,7 @@ model:
   use_omega_gate: true
   use_cuda: true # CUDA backend for 50-100x speedup (requires omega_window=16)
   poly_degree: 2 # Default: 2 (탐색: 2 or 3)
-  poly_mode: "elementwise" # Default: elementwise
+  poly_mode: "polysketch" # For polysketch trained models
   qk_norm: false # Default: false (탐색: false or true)
   qkv_conv_kernel: null # Default: null (탐색: null or 4)
   use_rope: false # Default: false (탐색: false or true)

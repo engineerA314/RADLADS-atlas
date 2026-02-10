@@ -54,9 +54,10 @@ fi
 TOKENS="${TOKENS:-${3:-250000000}}"
 DEVICES="${DEVICES:-${4:-1}}"
 NUM_NODES="${NUM_NODES:-1}"
-ACC_GRAD="${ACC_GRAD:-1}"
+# Stage 3 paper default uses global batch=96 (micro=2, devices=8, acc_grad=6).
+ACC_GRAD="${ACC_GRAD:-6}"
 STRATEGY="${STRATEGY:-auto}"
-GRAD_CP="${GRAD_CP:-0}"
+GRAD_CP="${GRAD_CP:-1}"
 DS_BUCKET_MB="${DS_BUCKET_MB:-200}"
 DATA_PREFIX="${DATA_PREFIX:-data/dclm-10B}"
 export DATA_PREFIX
@@ -68,6 +69,7 @@ TOKENS_SCHEDULE="${TOKENS_SCHEDULE:-}"
 FULL_AUTO_RESUME="${FULL_AUTO_RESUME:-1}"
 FORCE_FRESH="${FORCE_FRESH:-0}"
 DRY_RUN="${DRY_RUN:-0}"
+FULL_RESUME_ALLOW_NO_META="${FULL_RESUME_ALLOW_NO_META:-0}"
 
 # Check if checkpoint exists
 if [ ! -f "$STAGE2_CKPT" ]; then
@@ -287,6 +289,20 @@ PY
                     echo "✅ FULL auto-resume enabled for ${STEP_LABEL}: ckpt_path=${FULL_RESUME_CKPT_PATH}"
                 else
                     echo "⚠️ FULL resume files failed to download for ${STEP_LABEL}; starting fresh."
+                fi
+            elif [ "${FULL_RESUME_ALLOW_NO_META}" = "1" ]; then
+                FULL_GCS_CKPT_DIR="${FULL_GCS_CKPT%/}/"
+                if gsutil ls "${FULL_GCS_CKPT_DIR}" >/dev/null 2>&1; then
+                    mkdir -p "${FULL_RESUME_LOCAL_CKPT}"
+                    echo "⚠️ FULL resume meta missing for ${STEP_LABEL}. Forcing resume from checkpoint dir."
+                    gsutil -m rsync -r "${FULL_GCS_CKPT_DIR}" "${FULL_RESUME_LOCAL_CKPT}/" || true
+                    if [ -e "${FULL_RESUME_LOCAL_CKPT}" ]; then
+                        export FULL_RESUME_CKPT_PATH="${FULL_RESUME_LOCAL_CKPT}"
+                        export FULL_RESUME=1
+                        echo "✅ FULL auto-resume enabled for ${STEP_LABEL} (no meta): ckpt_path=${FULL_RESUME_CKPT_PATH}"
+                    else
+                        echo "⚠️ FULL resume checkpoint dir failed to download for ${STEP_LABEL}; starting fresh."
+                    fi
                 fi
             fi
         fi

@@ -340,15 +340,56 @@ class train_callback(pl.Callback):
 
         return (False, "")
 
-    # def on_after_backward(self, trainer, pl_module):
-    #     will_exit = False
-    #     for name,p in pl_module.named_parameters(): 
-    #         grad = deepspeed.utils.safe_get_full_grad(p)
-    #         if not grad is None: 
-    #             will_exit = True
-    #             print(name, p.norm().item(), grad.norm().item())
-    #     if will_exit:
-    #         exit()
+    def on_after_backward(self, trainer, pl_module) -> None:
+        # Stage 2 NaN debug: print per-layer parameter gradient absmax (gradient explosion check).
+        # Usage: SKIP_NAN_CHECK=1 STAGE2_DEBUG_GRAD_ABSMAX=1 bash gcp_test/debug_nan_stage2.sh
+        if os.environ.get("STAGE2_DEBUG_GRAD_ABSMAX", "").strip().lower() not in ("1", "true", "yes"):
+            return
+        if not trainer.is_global_zero:
+            return
+        try:
+            model = getattr(pl_module, "model", pl_module)
+            layer_absmax = {}
+            for name, p in model.named_parameters():
+                if p.grad is None:
+                    try:
+                        grad = deepspeed.utils.safe_get_full_grad(p)
+                    except Exception:
+                        grad = None
+                else:
+                    grad = p.grad
+                if grad is None:
+                    continue
+                g = grad.detach().float()
+                if not torch.isfinite(g).any():
+                    absmax = float("nan")
+                else:
+                    absmax = float(g.abs().max().item())
+                # Group by layer: model.layers.0.* -> 0, model.layers.23.* -> 23
+                parts = name.split(".")
+                layer_idx = None
+                for i, part in enumerate(parts):
+                    if part == "layers" and i + 1 < len(parts) and parts[i + 1].isdigit():
+                        layer_idx = int(parts[i + 1])
+                        break
+                if layer_idx is not None:
+                    if layer_idx not in layer_absmax:
+                        layer_absmax[layer_idx] = absmax
+                    else:
+                        try:
+                            cur = layer_absmax[layer_idx]
+                            if math.isfinite(cur) and math.isfinite(absmax):
+                                layer_absmax[layer_idx] = max(cur, absmax)
+                            elif math.isfinite(absmax):
+                                layer_absmax[layer_idx] = absmax
+                        except Exception:
+                            layer_absmax[layer_idx] = absmax
+            if layer_absmax:
+                print("[STAGE2_DEBUG_GRAD_ABSMAX] per-layer max param grad absmax (backward order ~ layer 23 -> 0):")
+                for idx in sorted(layer_absmax.keys(), reverse=True):
+                    print(f"  layer{idx} ~ {layer_absmax[idx]:.6e}")
+        except Exception as e:
+            print(f"[STAGE2_DEBUG_GRAD_ABSMAX] error: {e}")
 
     def on_predict_start(self, trainer, pl_module) -> None:
         pl_module.load_weights()
@@ -364,6 +405,183 @@ class train_callback(pl.Callback):
         self._early_best = None
         self._early_bad_count = 0
         self._early_target_good = 0
+        self._ensure_logging_state(trainer)
+        self._init_wandb(trainer, pl_module)
+
+    def _ensure_logging_state(self, trainer) -> None:
+        if not trainer.is_global_zero:
+            return
+        config = self.config
+        if not hasattr(trainer, "my_loss_sum"):
+            trainer.my_loss_sum = 0
+        if not hasattr(trainer, "my_loss_count"):
+            trainer.my_loss_count = 0
+        if not hasattr(trainer, "my_time_ns"):
+            trainer.my_time_ns = time.time_ns()
+        try:
+            if (not hasattr(trainer, "my_log")) or trainer.my_log is None or trainer.my_log.closed:
+                trainer.my_log = open(config.runtime.proj_path + "/train_log.txt", "a")
+                run_tag = "RESUME RUN" if trainer.global_step > 0 else "NEW RUN"
+                trainer.my_log.write(f"{run_tag} {config.runtime.my_timestamp}\n")
+                trainer.my_log.flush()
+        except Exception:
+            pass
+
+    def _init_wandb(self, trainer, pl_module) -> None:
+        if not trainer.is_global_zero:
+            return
+        config = self.config
+        if len(config.train.wandb) == 0:
+            return
+        if hasattr(trainer, "my_wandb") and trainer.my_wandb is not None:
+            return
+        try:
+            print("Login to wandb...")
+            import wandb
+            exp_id = os.environ.get("EXP_ID", "").strip()
+            run_id = os.environ.get("RUN_ID", "").strip()
+
+            def _short_bool(v) -> str:
+                return "1" if str(v).lower() in ("1", "true", "yes", "y", "t") else "0"
+
+            def _get_hf_meta(m) -> tuple[str, str] | None:
+                """
+                Return (pretty_name, ld_summary) if this looks like an HF model.
+                """
+                cfg = getattr(m, "config", None)
+                if cfg is None:
+                    return None
+                # HF config usually exposes these
+                n_layer = getattr(cfg, "num_hidden_layers", None)
+                n_embd = getattr(cfg, "hidden_size", None)
+                # Prefer the configured hf_path for readability
+                hf_path = getattr(config.model, "hf_path", "") or ""
+                base = hf_path.split("/")[-1] if hf_path else (getattr(cfg, "_name_or_path", "") or getattr(cfg, "name_or_path", "") or "")
+                base = str(base).strip() or "hf-model"
+                ld = []
+                if n_layer is not None:
+                    ld.append(f"L{int(n_layer)}")
+                if n_embd is not None:
+                    ld.append(f"D{int(n_embd)}")
+                return (base, " ".join(ld).strip())
+
+            def _stage_label() -> str:
+                # Highest-signal: explicit distillation stage if present.
+                s = getattr(config.train, "attention_distillation_stage", None)
+                if s == 1:
+                    return "stage1-align"
+                if s == 2:
+                    return "stage2-kl"
+                # Fall back to suffix if provided in yaml.
+                suf = (getattr(config.train, "proj_suffix", "") or "").strip()
+                return suf or "train"
+
+            # Build a meaning-first run name from *actual* model + knobs.
+            # This avoids legacy defaults like tmix=x060, n_layer=6, n_embd=512 leaking into W&B.
+            ts = str(config.runtime.my_timestamp)
+            stage = _stage_label()
+
+            # Model meta (HF)
+            hf_meta = _get_hf_meta(pl_module.model)
+            model_part = ""
+            if hf_meta is not None:
+                base, ld = hf_meta
+                model_part = base + (f" {ld}" if ld else "")
+
+            ctx = getattr(config.model, "ctx_len", None)
+            ctx_part = f"ctx{int(ctx)}" if ctx is not None else ""
+
+            # Atlas knobs (even in stage1 HF patching, these live in config.model)
+            knobs = []
+            for k, label in [
+                ("atlas_variant", "atlas"),
+                ("omega_window", "ow"),
+                ("poly_degree", "poly"),
+                ("qk_norm", "qknorm"),
+                ("qkv_conv_kernel", "qkvconv"),
+                ("use_rope", "rope"),
+                ("use_groupnorm", "gn"),
+            ]:
+                v = getattr(config.model, k, None)
+                if v is None:
+                    continue
+                if k in ("qk_norm", "use_rope", "use_groupnorm"):
+                    knobs.append(f"{label}{_short_bool(v)}")
+                elif k == "atlas_variant":
+                    knobs.append(f"{label}={v}")
+                else:
+                    knobs.append(f"{label}={v}")
+
+            # Example:
+            # 2025-12-26-02-05-22 | setup-smoke-stage1/20251226-015909 | stage1-align | Qwen2.5-0.5B-Instruct L24 D896 ctx512 | atlas=lmm ow=16 poly=2 qknorm0 qkvconv=None rope0 gn0
+            parts = [ts]
+            if exp_id or run_id:
+                parts.append(f"{exp_id}/{run_id}".strip("/"))
+            parts.append(stage)
+            if model_part:
+                parts.append(model_part)
+            if ctx_part:
+                parts.append(ctx_part)
+            if knobs:
+                parts.append(" ".join(knobs))
+            wandb_name = " | ".join([p for p in parts if p])
+
+            def _short_tag(tag: str, max_len: int = 64) -> str:
+                if len(tag) <= max_len:
+                    return tag
+                import hashlib
+                suffix = hashlib.sha1(tag.encode("utf-8")).hexdigest()[:6]
+                return f"{tag[:max_len - 7]}~{suffix}"
+
+            tags = []
+            if exp_id:
+                tags.append(_short_tag(f"exp:{exp_id}"))
+            if run_id:
+                tags.append(_short_tag(f"run:{run_id}"))
+            tags.append(_short_tag(f"stage:{stage}"))
+            if ctx_part:
+                tags.append(_short_tag(ctx_part))
+            if str(os.environ.get("SMOKE_TEST", "")).strip() == "1":
+                tags.append("smoke")
+
+            env_mode = os.environ.get("WANDB_MODE", "").strip()
+            env_disabled = os.environ.get("WANDB_DISABLED", "").strip()
+            has_key = "set" if os.environ.get("WANDB_API_KEY") else "empty"
+            print(
+                f"[wandb] project={config.train.wandb} mode={env_mode} "
+                f"disabled={env_disabled} api_key={has_key} "
+                f"exp_id={exp_id} run_id={run_id}"
+            )
+            init_kwargs = dict(
+                project=config.train.wandb,
+                name=wandb_name,
+                config=config,
+                save_code=False,
+                tags=tags,
+            )
+            if exp_id:
+                init_kwargs["group"] = exp_id
+            wandb.init(**init_kwargs)
+            trainer.my_wandb = wandb
+        except Exception as e:
+            try:
+                print(f"[wandb] init failed: {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
+            except Exception:
+                pass
+        try:
+            step_csv_path = os.path.join(config.runtime.proj_path, "train_steps.csv")
+            if (not hasattr(trainer, "my_step_log")) or trainer.my_step_log is None or trainer.my_step_log.closed:
+                is_new = not os.path.exists(step_csv_path) or os.path.getsize(step_csv_path) == 0
+                trainer.my_step_log = open(step_csv_path, "a")
+                if is_new:
+                    trainer.my_step_log.write(
+                        "timestamp,real_global_step,tokens,loss,lr,lr2,weight_decay,kt_per_s,ctx_len,global_step_bsz\n"
+                    )
+                trainer.my_step_log.flush()
+        except Exception:
+            pass
 
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         config = self.config
@@ -400,6 +618,9 @@ class train_callback(pl.Callback):
                     case 'oneminussqrt':
                         init_amt = 1.0 - math.sqrt(lr_progress)
                         return lr_final + (lr_init - lr_final) * init_amt
+                    case 'none':
+                        # No decay: keep lr constant at lr_init
+                        return lr_init
                     case _:
                         print("bad lr_decay_type specified")
                         exit()
@@ -482,119 +703,7 @@ class train_callback(pl.Callback):
                     pass
                 trainer.my_log.flush()
                 trainer.my_step_log.flush()
-                if len(config.train.wandb) > 0:
-                    print("Login to wandb...")
-                    import wandb
-                    exp_id = os.environ.get("EXP_ID", "").strip()
-                    run_id = os.environ.get("RUN_ID", "").strip()
-
-                    def _short_bool(v) -> str:
-                        return "1" if str(v).lower() in ("1", "true", "yes", "y", "t") else "0"
-
-                    def _get_hf_meta(m) -> tuple[str, str] | None:
-                        """
-                        Return (pretty_name, ld_summary) if this looks like an HF model.
-                        """
-                        cfg = getattr(m, "config", None)
-                        if cfg is None:
-                            return None
-                        # HF config usually exposes these
-                        n_layer = getattr(cfg, "num_hidden_layers", None)
-                        n_embd = getattr(cfg, "hidden_size", None)
-                        # Prefer the configured hf_path for readability
-                        hf_path = getattr(config.model, "hf_path", "") or ""
-                        base = hf_path.split("/")[-1] if hf_path else (getattr(cfg, "_name_or_path", "") or getattr(cfg, "name_or_path", "") or "")
-                        base = str(base).strip() or "hf-model"
-                        ld = []
-                        if n_layer is not None:
-                            ld.append(f"L{int(n_layer)}")
-                        if n_embd is not None:
-                            ld.append(f"D{int(n_embd)}")
-                        return (base, " ".join(ld).strip())
-
-                    def _stage_label() -> str:
-                        # Highest-signal: explicit distillation stage if present.
-                        s = getattr(config.train, "attention_distillation_stage", None)
-                        if s == 1:
-                            return "stage1-align"
-                        if s == 2:
-                            return "stage2-kl"
-                        # Fall back to suffix if provided in yaml.
-                        suf = (getattr(config.train, "proj_suffix", "") or "").strip()
-                        return suf or "train"
-
-                    # Build a meaning-first run name from *actual* model + knobs.
-                    # This avoids legacy defaults like tmix=x060, n_layer=6, n_embd=512 leaking into W&B.
-                    ts = str(config.runtime.my_timestamp)
-                    stage = _stage_label()
-
-                    # Model meta (HF)
-                    hf_meta = _get_hf_meta(pl_module.model)
-                    model_part = ""
-                    if hf_meta is not None:
-                        base, ld = hf_meta
-                        model_part = base + (f" {ld}" if ld else "")
-
-                    ctx = getattr(config.model, "ctx_len", None)
-                    ctx_part = f"ctx{int(ctx)}" if ctx is not None else ""
-
-                    # Atlas knobs (even in stage1 HF patching, these live in config.model)
-                    knobs = []
-                    for k, label in [
-                        ("atlas_variant", "atlas"),
-                        ("omega_window", "ow"),
-                        ("poly_degree", "poly"),
-                        ("qk_norm", "qknorm"),
-                        ("qkv_conv_kernel", "qkvconv"),
-                        ("use_rope", "rope"),
-                        ("use_groupnorm", "gn"),
-                    ]:
-                        v = getattr(config.model, k, None)
-                        if v is None:
-                            continue
-                        if k in ("qk_norm", "use_rope", "use_groupnorm"):
-                            knobs.append(f"{label}{_short_bool(v)}")
-                        elif k == "atlas_variant":
-                            knobs.append(f"{label}={v}")
-                        else:
-                            knobs.append(f"{label}={v}")
-
-                    # Example:
-                    # 2025-12-26-02-05-22 | setup-smoke-stage1/20251226-015909 | stage1-align | Qwen2.5-0.5B-Instruct L24 D896 ctx512 | atlas=lmm ow=16 poly=2 qknorm0 qkvconv=None rope0 gn0
-                    parts = [ts]
-                    if exp_id or run_id:
-                        parts.append(f"{exp_id}/{run_id}".strip("/"))
-                    parts.append(stage)
-                    if model_part:
-                        parts.append(model_part)
-                    if ctx_part:
-                        parts.append(ctx_part)
-                    if knobs:
-                        parts.append(" ".join(knobs))
-                    wandb_name = " | ".join([p for p in parts if p])
-
-                    tags = []
-                    if exp_id:
-                        tags.append(f"exp:{exp_id}")
-                    if run_id:
-                        tags.append(f"run:{run_id}")
-                    tags.append(f"stage:{stage}")
-                    if ctx_part:
-                        tags.append(ctx_part)
-                    if str(os.environ.get("SMOKE_TEST", "")).strip() == "1":
-                        tags.append("smoke")
-
-                    init_kwargs = dict(
-                        project=config.train.wandb,
-                        name=wandb_name,
-                        config=config,
-                        save_code=False,
-                        tags=tags,
-                    )
-                    if exp_id:
-                        init_kwargs["group"] = exp_id
-                    wandb.init(**init_kwargs)
-                    trainer.my_wandb = wandb
+                self._init_wandb(trainer, pl_module)
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         config = self.config
@@ -604,6 +713,7 @@ class train_callback(pl.Callback):
         # NOTE: Lightning may pass `outputs` as a dict like {"loss": tensor} even if training_step returns a tensor.
         micro_step_loss = None
         if trainer.is_global_zero:  # logging
+            self._ensure_logging_state(trainer)
             t_now = time.time_ns()
             kt_s = 0
             try:
@@ -667,8 +777,8 @@ class train_callback(pl.Callback):
                     }
                     if kt_s > 0:
                         metrics["train/kt_per_s"] = float(kt_s)
-                    trainer.my_wandb.log(metrics, step=int(real_global_step))
-
+                    if hasattr(trainer, 'my_wandb'):
+                        trainer.my_wandb.log(metrics, step=int(real_global_step))
         # Early stopping (optional). Must be synchronized across ranks.
         #
         # CRITICAL:
@@ -712,10 +822,42 @@ class train_callback(pl.Callback):
                         trainer.my_log.close()
                 except Exception:
                     pass
+                
+                # Save checkpoint locally
+                local_ckpt_path = f"{config.runtime.proj_path}/rwkv-final.pth"
                 try:
-                    pl_module.save_weights(f"{config.runtime.proj_path}/rwkv-final.pth")
-                except Exception:
-                    pass
+                    pl_module.save_weights(local_ckpt_path)
+                    print(f"[early-stop] saved checkpoint: {local_ckpt_path}", flush=True)
+                except Exception as e:
+                    print(f"[early-stop] ERROR saving checkpoint: {e}", flush=True)
+                
+                # Upload to GCS (if configured)
+                try:
+                    gcs_bucket = getattr(config.train, "gcs_bucket", None) or os.environ.get("GCS_BUCKET", "")
+                    gcs_prefix = getattr(config.train, "gcs_prefix", None) or os.environ.get("GCS_PREFIX", "")
+                    exp_id = getattr(config.train, "exp_id", None) or os.environ.get("EXP_ID", "")
+                    run_id = getattr(config.train, "run_id", None) or os.environ.get("RUN_ID", "")
+                    
+                    if gcs_bucket and exp_id:
+                        stage_label = self._stage_label_for_gcs()
+                        if run_id:
+                            gcs_dir = f"{gcs_bucket.rstrip('/')}/{gcs_prefix}/{exp_id}/{run_id}/checkpoints/{stage_label}"
+                        else:
+                            gcs_dir = f"{gcs_bucket.rstrip('/')}/{gcs_prefix}/{exp_id}/_latest/checkpoints/{stage_label}"
+                        gcs_ckpt_path = f"{gcs_dir}/rwkv-final.pth"
+                        
+                        print(f"[early-stop] uploading checkpoint to GCS → {gcs_ckpt_path}", flush=True)
+                        import subprocess
+                        r = subprocess.run(["gsutil", "cp", "-q", local_ckpt_path, gcs_ckpt_path], check=False)
+                        if r.returncode != 0:
+                            print(f"[early-stop] GCS upload failed with -q (rc={r.returncode}); retrying without -q", flush=True)
+                            subprocess.run(["gsutil", "cp", local_ckpt_path, gcs_ckpt_path], check=False)
+                        print(f"[early-stop] ✅ checkpoint uploaded to GCS", flush=True)
+                    else:
+                        print(f"[early-stop] GCS not configured (bucket={bool(gcs_bucket)}, exp_id={bool(exp_id)}), skipping upload", flush=True)
+                except Exception as e:
+                    print(f"[early-stop] ERROR uploading to GCS: {e}", flush=True)
+                
                 print(f"!!!EARLY STOP!!! {stop_reason}")
 
             # Ensure all ranks reach the exit together (prevents noisy comms warnings and avoids

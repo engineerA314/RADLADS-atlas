@@ -22,7 +22,8 @@ model:
   # Atlas memory hyperparameters (must match Stage 2 for checkpoint compatibility)
   use_momentum: true
   use_omega_gate: true
-  omega_window: 4
+  omega_window: 16 # Must be 16 for CUDA backend
+  use_cuda: true # Enable CUDA backend for 50-100x speedup
   poly_degree: 2
   poly_mode: "elementwise"
   qk_norm: false

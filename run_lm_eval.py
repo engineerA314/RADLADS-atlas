@@ -9,7 +9,33 @@ import numpy as np
 np.set_printoptions(precision=4, suppress=True, linewidth=200)
 
 #import transformers # just for a bugfix for 0.4.2 of lm_eval
+import transformers
+import datasets
 from transformers import AutoModelForCausalLM
+
+# lm_eval imports hf_vlms which expects AutoModelForVision2Seq.
+# Patch LazyModule getattr for compatibility with this transformers build.
+if not hasattr(transformers, "AutoModelForVision2Seq"):
+    _orig_getattr = transformers.__class__.__getattr__
+
+    def _patched_getattr(self, name):
+        if name == "AutoModelForVision2Seq":
+            from transformers import AutoModelForSeq2SeqLM
+            return AutoModelForSeq2SeqLM
+        return _orig_getattr(self, name)
+
+    transformers.__class__.__getattr__ = _patched_getattr
+
+# Hugging Face "winogrande" dataset is currently unreachable in this env.
+# Redirect to the equivalent mirror dataset.
+_orig_load_dataset = datasets.load_dataset
+
+def _patched_load_dataset(path, *args, **kwargs):
+    if path == "winogrande":
+        path = "allenai/winogrande"
+    return _orig_load_dataset(path, *args, **kwargs)
+
+datasets.load_dataset = _patched_load_dataset
 
 import torch
 torch.backends.cudnn.benchmark = True
@@ -26,7 +52,12 @@ os.environ["RWKV_CUDA_ON"] = '1'
 
 #from src.pipeline import PIPELINE, PIPELINE_ARGS
 
-from transformers.modeling_utils import load_state_dict, load_sharded_checkpoint
+try:
+    from transformers.modeling_utils import load_state_dict, load_sharded_checkpoint
+except Exception:
+    # These helpers are unused here; keep optional for newer/older transformers.
+    load_state_dict = None
+    load_sharded_checkpoint = None
 
 from lm_eval import tasks, evaluator, utils
 from lm_eval.api.model import TemplateLM
@@ -345,16 +376,19 @@ RWKV_PAD = []
 adapter = EvalHarnessAdapter(batch_size_per_gpu=config.bsz, tokenizer=tokenizer)
 with torch.no_grad():
     with torch.amp.autocast(device_type='cuda', dtype=dtype):
-	    results = evaluator.simple_evaluate(
+	    eval_kwargs = dict(
 	        model=adapter,
 	        tasks=eval_tasks,
 	        #provide_description=False,
 	        num_fewshot=config.num_fewshot,
 	        limit=None,
 	        bootstrap_iters=10000,
-	        numpy_random_seed = config.seed,
-	        torch_random_seed = config.seed,
-	        fewshot_random_seed = config.seed,
+	        numpy_random_seed=config.seed,
+	        torch_random_seed=config.seed,
 	    )
+	    import inspect
+	    if "fewshot_random_seed" in inspect.signature(evaluator.simple_evaluate).parameters:
+	        eval_kwargs["fewshot_random_seed"] = config.seed
+	    results = evaluator.simple_evaluate(**eval_kwargs)
 
 print(results['results'])

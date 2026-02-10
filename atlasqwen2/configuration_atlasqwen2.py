@@ -38,7 +38,7 @@ class AtlasQwen2Config(PretrainedConfig):
         poly_degree (`int`, *optional*, defaults to 1):
             Polynomial feature map degree.
         poly_mode (`str`, *optional*, defaults to 'off'):
-            Polynomial feature map mode ('off', 'elementwise', 'tensor').
+            Polynomial feature map mode ('off', 'elementwise', 'tensor', 'polysketch').
         qk_norm (`bool`, *optional*, defaults to True):
             Whether to apply normalization to Q and K.
         qkv_conv_kernel (`int`, *optional*, defaults to None):

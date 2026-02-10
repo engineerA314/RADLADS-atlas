@@ -2,21 +2,24 @@
 # Install with: pip install -r requirements.txt
 
 # Core ML
-torch>=2.1.0
-lightning>=2.0.0
+# Reproducible stack (stage1 eval 2026-01-22)
+# NOTE: torch==2.10.0 requires the nightly/cu128 index URL.
+torch==2.10.0
+lightning==2.6.0
+pytorch-lightning==2.6.0
 transformers>=4.40.0
 safetensors>=0.4.0
 
 # Attention/Memory Kernels
 flash-linear-attention>=0.0.1
-triton>=2.1.0
-assoc-scan>=0.0.2  # Provides AssocScan for efficient RNN parallelization (from lucidrains)
+triton==3.6.0
+assoc-scan==0.0.4  # Provides AssocScan for efficient RNN parallelization (from lucidrains)
 # Optional dependency used by assoc-scan's accelerated path:
 # assoc_scan/assoc_scan.py imports `accelerated_scan.triton` when use_accelerated=True.
-accelerated-scan>=0.2.0
+accelerated-scan==0.3.1
 
 # Training Infrastructure
-deepspeed>=0.12.0
+deepspeed==0.18.4
 accelerate>=1.0.0
 wandb>=0.16.0
 ninja>=1.11.0

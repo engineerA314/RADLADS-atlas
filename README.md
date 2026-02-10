@@ -949,7 +949,7 @@ model:
   memory_dim_head: 64
   use_momentum: true
   poly_degree: 1
-  poly_mode: "off" # "off", "elementwise", "tensor"
+  poly_mode: "off" # "off", "elementwise", "tensor", "polysketch"
   qk_norm: true
   qkv_conv_kernel: null
 

@@ -11,6 +11,7 @@ Usage:
     python train.py -c configs/atlasqwen0b5.yaml -c configs/distill1.yaml
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,6 +25,23 @@ from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
 from models.atlas_memory import RNNMemory, RNNMemState
+
+_NAN_DEBUG_CTX = {"batch_idx": None, "global_step": None}
+
+
+def set_nan_debug_context(*, batch_idx: int | None = None, global_step: int | None = None) -> None:
+    _NAN_DEBUG_CTX["batch_idx"] = batch_idx
+    _NAN_DEBUG_CTX["global_step"] = global_step
+    try:
+        if batch_idx is not None:
+            os.environ["NAN_DEBUG_BATCH_IDX"] = str(int(batch_idx))
+    except Exception:
+        pass
+
+
+def get_nan_debug_context() -> dict:
+    # Return a shallow copy so callers can't mutate global state.
+    return dict(_NAN_DEBUG_CTX)
 
 
 class AtlasSelfAttention(nn.Module):
@@ -49,6 +67,9 @@ class AtlasSelfAttention(nn.Module):
         omega_window = getattr(config, 'omega_window', 4)
         use_omega_gate = getattr(config, 'use_omega_gate', True)
         use_momentum = getattr(config, 'use_momentum', True)
+        use_cuda = getattr(config, 'use_cuda', False)  # CUDA backend for 50-100x speedup
+        use_accelerated_scan = getattr(config, 'use_accelerated_scan', True)
+        memory_scan_chunk_len = getattr(config, 'memory_scan_chunk_len', None)
         poly_degree = getattr(config, 'poly_degree', 2)
         poly_mode = getattr(config, 'poly_mode', 'elementwise')
         qk_norm = getattr(config, 'qk_norm', False)
@@ -77,6 +98,9 @@ class AtlasSelfAttention(nn.Module):
             use_momentum=use_momentum,
             omega_window=omega_window,
             use_omega_gate=use_omega_gate,
+            use_cuda=use_cuda,
+            use_accelerated_scan=use_accelerated_scan,
+            scan_chunk_len=memory_scan_chunk_len,
             poly_degree=poly_degree,
             poly_mode=poly_mode,
             qk_norm=qk_norm,
@@ -86,6 +110,14 @@ class AtlasSelfAttention(nn.Module):
             max_position_embeddings=max_position_embeddings,
             use_groupnorm=use_groupnorm,
         )
+
+        # Expose layer index for deep debugging (used by omega debug hooks).
+        try:
+            self.memory.layer_idx = int(layer_idx)
+            if hasattr(self.memory, "cell"):
+                self.memory.cell.layer_idx = int(layer_idx)
+        except Exception:
+            pass
         
         # Layer-specific state storage (for streaming)
         self._memory_state = None
@@ -181,12 +213,42 @@ class AttentionDistillationWrapper(nn.Module):
                 student_params_dict[n].requires_grad_(False)
                 student_params_dict[n].copy_(p)
                 student_params_dict[n].requires_grad_(p.requires_grad)
+
+        # Explicit Q/K/V/O transfer for Atlas memory (names do not match HF attention)
+        # This mirrors the RADLADS paper's "attention weight transfer" setup.
+        self._copy_teacher_qkvo_if_possible()
+
+    def _copy_teacher_qkvo_if_possible(self) -> None:
+        teacher = self.teacher_attn
+        student = self.student_attn
+
+        # AtlasSelfAttention owns an RNNMemory wrapper; projections live on its cell.
+        memory = getattr(student, "memory", None)
+        cell = getattr(memory, "cell", memory) if memory is not None else None
+        if cell is None:
+            return
+
+        def _copy_weight(src: nn.Module | None, dst: nn.Module | None) -> None:
+            if src is None or dst is None:
+                return
+            if not (hasattr(src, "weight") and hasattr(dst, "weight")):
+                return
+            if src.weight.shape != dst.weight.shape:
+                return
+            with torch.no_grad():
+                dst.weight.copy_(src.weight)
+
+        _copy_weight(getattr(teacher, "q_proj", None), getattr(cell, "to_q", None))
+        _copy_weight(getattr(teacher, "k_proj", None), getattr(cell, "to_k", None))
+        _copy_weight(getattr(teacher, "v_proj", None), getattr(cell, "to_v", None))
+        _copy_weight(getattr(teacher, "o_proj", None), getattr(cell, "to_out", None))
     
     def forward(self, hidden_states, *args, **kwargs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Forward pass running both teacher and student.
         
-        Returns STUDENT output (for gradient flow), but computes alignment loss.
+        Returns TEACHER output to preserve forward behavior.
+        Student gradients come from the alignment loss only.
         HuggingFace Qwen2 expects (hidden_states, attention_weights) tuple.
         """
         # Don't need actual attention weights from teacher
@@ -211,7 +273,8 @@ class AttentionDistillationWrapper(nn.Module):
         
         # Return (hidden_states, attention_weights) as expected by HF Qwen2
         # attention_weights is the alignment_loss for collection
-        return (student_outputs[0], alignment_loss)
+        return (teacher_outputs[0], alignment_loss) + teacher_outputs[2:]
+
 
 
 def load_and_patch_model_with_attention_replacement(
@@ -241,7 +304,8 @@ def load_and_patch_model_with_attention_replacement(
     if atlas_model_config is not None:
         for k in [
             # Omega / core Atlas
-            'omega_window', 'use_omega_gate', 'use_momentum',
+            'omega_window', 'use_omega_gate', 'use_momentum', 'use_cuda',
+            'use_accelerated_scan', 'memory_scan_chunk_len',
             # Ablation knobs
             'poly_degree', 'poly_mode', 'qk_norm', 'qkv_conv_kernel', 'use_rope', 'use_groupnorm',
             # Optional RoPE params
