@@ -173,5 +173,4 @@ docs/
 scripts/ablation/
 ABLATION.md
 CLAUDE.md
-TRAINING_RESULTS.md
 *.code-workspace
